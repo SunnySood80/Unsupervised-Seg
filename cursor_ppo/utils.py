@@ -157,19 +157,90 @@ def compute_cluster_separation_fast(features: torch.Tensor, eps: float = 0.5) ->
     return float(separation.item()), centers
 
 
-def compute_feature_diversity(features: torch.Tensor) -> float:
+def compute_feature_diversity(features: torch.Tensor, batch_size: int = 32) -> float:
     """
-    Compute how diverse the features are: 1 - mean cosine similarity.
+    Compute diversity score for features in a memory-efficient way
+    
+    Args:
+        features: Tensor of shape [N, C, H, W]
+        batch_size: Size of batches to process at once
     """
-    features_flat = F.normalize(features.view(-1, features.size(-1)), dim=1)
-    similarity = torch.mm(features_flat, features_flat.t())
-    similarity.fill_diagonal_(0)
-    return float(1.0 - similarity.mean().item())
+    # Move to CPU and flatten features
+    features = features.cpu()
+    N, C, H, W = features.shape
+    features_flat = features.view(N, -1)  # [N, C*H*W]
+    
+    # Normalize features
+    features_flat = F.normalize(features_flat, p=2, dim=1)
+    
+    total_similarity = 0
+    count = 0
+    
+    # Process in batches to avoid memory issues
+    for i in range(0, N, batch_size):
+        batch_end = min(i + batch_size, N)
+        current_batch = features_flat[i:batch_end]
+        
+        # Compute similarity for current batch with all features
+        for j in range(0, N, batch_size):
+            j_end = min(j + batch_size, N)
+            other_batch = features_flat[j:j_end]
+            
+            # Compute batch similarity
+            batch_similarity = torch.mm(current_batch, other_batch.t())
+            
+            # Don't count self-similarities
+            if i == j:
+                batch_similarity.fill_diagonal_(0)
+            
+            total_similarity += batch_similarity.sum().item()
+            count += (batch_end - i) * (j_end - j)
+            if i == j:
+                count -= (batch_end - i)  # Subtract diagonal count
+    
+    # Compute average similarity
+    avg_similarity = total_similarity / max(count, 1)
+    
+    # Convert similarity to diversity (higher is better)
+    diversity = 1 - avg_similarity
+    
+    return diversity
 
-def compute_consistency_reward(original_feats: torch.Tensor, aug_feats_list: List[torch.Tensor]) -> float:
+def compute_feature_statistics(features):
+    """
+    Compute basic statistics of features in a memory-efficient way
+    """
+    # Move to CPU for statistics
+    features = features.cpu()
+    
+    mean = features.mean().item()
+    std = features.std().item()
+    
+    return {
+        'mean': mean,
+        'std': std
+    }
+
+# Add a memory tracking decorator for debugging if needed
+def track_memory(func):
+    def wrapper(*args, **kwargs):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print(f"GPU memory before {func.__name__}: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+        result = func(*args, **kwargs)
+        if torch.cuda.is_available():
+            print(f"GPU memory after {func.__name__}: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+        return result
+    return wrapper
+
+def compute_consistency_reward(original_feats: torch.Tensor, aug_feats_list: List[torch.Tensor] = None) -> float:
     """
     Compute consistency reward between original features and its augmentations.
+    If no augmentations provided, return a neutral reward.
     """
+    if aug_feats_list is None or len(aug_feats_list) == 0:
+        return 0.5  # Neutral reward when no augmentations
+        
     orig_flat = original_feats.view(original_feats.size(0), original_feats.size(1), -1)
     
     similarities = []
@@ -225,22 +296,112 @@ def compute_local_coherence(features: torch.Tensor, kernel_size: int = 3) -> flo
     coherence = -F.mse_loss(features, local_mean)
     return float(coherence.item())
 
-def compute_segmentation_map(w_feats: torch.Tensor) -> torch.Tensor:
+def compute_segmentation_map(features: torch.Tensor) -> torch.Tensor:
+    """Compute segmentation map from feature tensor"""
+    # Assuming features is [B, C, H, W]
+    B, C, H, W = features.shape
+    
+    # Average across channels and normalize
+    seg_map = features.mean(dim=1, keepdim=True)  # [B, 1, H, W]
+    seg_map = (seg_map - seg_map.min()) / (seg_map.max() - seg_map.min() + 1e-8)
+    
+    return seg_map.squeeze(1)  # Return [B, H, W]
+
+def visualize_map_with_augs(image_tensors: list, 
+                           heatmaps: list,
+                           ground_truth: np.ndarray,
+                           binary_mask: torch.Tensor,
+                           reward: float,
+                           save_path: str = None):
     """
-    Compute binary segmentation map from weighted features.
+    Creates a grid showing all augmentations and their maps.
+    Args:
+        image_tensors: List of [C,H,W] image tensors
+        heatmaps: List of [H,W] heatmap tensors
+        ground_truth: [H,W] numpy array of ground truth
+        binary_mask: [1,1,H,W] tensor of binary mask
+        reward: float value of current reward
+        save_path: Where to save the visualization
     """
-    feat_flat = w_feats.squeeze(0).permute(1,2,0).reshape(-1, w_feats.size(1))
-    feat_flat = F.normalize(feat_flat, dim=1)
+    n_images = len(image_tensors)
+    n_cols = 4  # [Image | GT | Map | Overlay]
+    n_rows = n_images
     
-    N, D = feat_flat.size()
-    idx = torch.randperm(N, device=w_feats.device)[:2]
-    centroids = feat_flat[idx].clone()
+    plt.figure(figsize=(20, 5*n_rows))
     
-    dists = torch.cdist(feat_flat, centroids)
-    clusters = dists.argmin(dim=1)
+    # Get target size from first heatmap
+    target_size = heatmaps[0].shape[-2:]  # Get last two dimensions
     
-    seg_map = clusters.reshape(w_feats.shape[2], w_feats.shape[3]).float()
-    seg_map = seg_map - seg_map.min()
-    seg_map = seg_map / (seg_map.max() + 1e-8)
+    # Prepare binary mask - ensure it's the right shape first
+    if binary_mask.dim() == 2:
+        binary_mask = binary_mask.unsqueeze(0).unsqueeze(0)
+    elif binary_mask.dim() == 3:
+        binary_mask = binary_mask.unsqueeze(0)
+        
+    # Ensure mask is the right size
+    mask = F.interpolate(
+        binary_mask,
+        size=target_size,
+        mode='nearest'
+    ).squeeze().cpu().numpy()  # Convert to numpy here
     
-    return seg_map
+    for idx, (img, hmap) in enumerate(zip(image_tensors, heatmaps)):
+        # Convert to numpy - handle both 3D and 4D inputs
+        if img.dim() == 4:  # (B,C,H,W)
+            img = img.squeeze(0)  # Remove batch dimension
+            
+        # Ensure image is same size as heatmap
+        img_resized = F.interpolate(
+            img.unsqueeze(0), 
+            size=target_size,
+            mode='bilinear',
+            align_corners=False
+        ).squeeze(0)
+        
+        img_np = img_resized.detach().cpu().permute(1,2,0).numpy()
+        
+        # Handle heatmap dimensions
+        hmap_np = hmap.detach().cpu().numpy()
+        if hmap_np.ndim == 3:  # If [B,H,W]
+            hmap_np = hmap_np.squeeze(0)  # Remove batch dimension
+        
+        # Resize ground truth to match
+        gt_tensor = torch.from_numpy(ground_truth).float().unsqueeze(0).unsqueeze(0)
+        gt_resized = F.interpolate(
+            gt_tensor,
+            size=target_size,
+            mode='nearest'
+        ).squeeze().numpy()
+        
+        # Apply mask to heatmap
+        hmap_np = hmap_np * mask  # Element-wise multiplication
+        
+        # Original Image
+        plt.subplot(n_rows, n_cols, idx*n_cols + 1)
+        plt.imshow(img_np)
+        plt.title(f"{'Original' if idx==0 else f'Augmentation {idx}'}")
+        plt.axis("off")
+        
+        # Ground Truth
+        plt.subplot(n_rows, n_cols, idx*n_cols + 2)
+        plt.imshow(gt_resized, cmap='gray')
+        plt.title("Ground Truth")
+        plt.axis("off")
+        
+        # Heatmap
+        plt.subplot(n_rows, n_cols, idx*n_cols + 3)
+        plt.imshow(hmap_np, cmap='hot')
+        plt.title(f"Segmentation Map (R={reward:.3f})")
+        plt.axis("off")
+        
+        # Overlay
+        plt.subplot(n_rows, n_cols, idx*n_cols + 4)
+        plt.imshow(img_np)
+        plt.imshow(hmap_np, cmap='hot', alpha=0.6)
+        plt.title("Overlay")
+        plt.axis("off")
+    
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path)
+    plt.close()
