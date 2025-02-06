@@ -234,22 +234,28 @@ class FeatureWeightingEnv(gym.Env):
             features = self._extract_features(sample_indices)
             
             # Compute rewards
-            diversity_reward = compute_feature_diversity(features)
-            consistency_reward = compute_consistency_reward(features)
+            cluster_sep = compute_feature_diversity(features)
             boundary_reward = compute_boundary_strength(features)
+            feat_div = compute_feature_diversity(features)
             coherence_reward = compute_local_coherence(features)
+            consistency = compute_consistency_reward(features)
+            memory_consistency = compute_consistency_reward(features)
+            contrastive_reward = compute_feature_diversity(features)
 
-            reward = (
-                0.5 * diversity_reward +
-                0.2 * consistency_reward +
-                0.2 * boundary_reward +
-                0.1 * coherence_reward
+            composite_reward = (
+                0.15 * cluster_sep +      # Cluster separation 
+                0.15 * boundary_reward +  # Edge detection
+                0.15 * feat_div +        # Feature diversity
+                0.15 * coherence_reward + # Local coherence
+                0.25 * consistency +      # Augmentation consistency
+                0.10 * memory_consistency + # Memory bank consistency
+                0.05 * contrastive_reward  # Contrastive learning
             )
 
         # Store metrics
-        self.reward_history.append(reward)
-        self.diversity_history.append(diversity_reward)
-        self.consistency_history.append(consistency_reward)
+        self.reward_history.append(composite_reward)
+        self.diversity_history.append(feat_div)
+        self.consistency_history.append(consistency)
         self.boundary_history.append(boundary_reward)
         self.coherence_history.append(coherence_reward)
 
@@ -262,7 +268,7 @@ class FeatureWeightingEnv(gym.Env):
         done = False
         info = {}
 
-        return obs, reward, done, info
+        return obs, composite_reward, done, info
 
     def _render(self):
         """Render current state visualization"""
@@ -288,16 +294,16 @@ class FeatureWeightingEnv(gym.Env):
         weighted_orig_feats = orig_feats * alpha
         weighted_aug_feats = [feat * alpha for feat in aug_feats_list]
         
-        # Compute segmentation maps
-        orig_map = compute_segmentation_map(weighted_orig_feats)
-        aug_maps = [compute_segmentation_map(f) for f in weighted_aug_feats]
+        # Compute segmentation maps with binary mask
+        orig_map = compute_segmentation_map(weighted_orig_feats, binary_mask)
+        aug_maps = [compute_segmentation_map(f, binary_mask) for f in weighted_aug_feats]
         
         # Use visualization function
         visualize_map_with_augs(
             image_tensors=[orig_img] + aug_list,
             heatmaps=[orig_map] + aug_maps,
             ground_truth=gt_mask,
-            binary_mask=binary_mask,  # Make sure this is defined globally
+            binary_mask=binary_mask,
             reward=self.reward_history[-1] if self.reward_history else 0,
             save_path=f'final_visuals/map_step_{self.total_steps}.png'
         )
@@ -319,8 +325,8 @@ def train_ddp(rank, world_size, processed_samples):
             os.makedirs('final_visuals', exist_ok=True)
         
         # Reduce memory usage per GPU
-        per_gpu_batch_size = 32  # Reduced from 64
-        n_steps = 256 // world_size  # Reduced from 512
+        per_gpu_batch_size = 128 
+        n_steps = 512 // world_size
         
         # Create environment
         feature_extractor = FilterWeightingSegmenter(pretrained=True).to(device)
@@ -338,7 +344,7 @@ def train_ddp(rank, world_size, processed_samples):
             device=device,
             batch_size=per_gpu_batch_size,
             enable_render=(rank == 0),
-            render_patience=10,
+            render_patience=50,
             visualize=True
         )
 
@@ -346,15 +352,15 @@ def train_ddp(rank, world_size, processed_samples):
         agent = PPO(
             env=env,
             n_steps=n_steps,
-            batch_size=16,
-            policy_hidden_sizes=[env.feature_dim * 2, env.feature_dim],  # Adjusted network sizes
-            value_hidden_sizes=[env.feature_dim, env.feature_dim // 2],
+            batch_size=512,
+            policy_hidden_sizes=[512, 512, 512],  # Adjusted network sizes
+            value_hidden_sizes=[512, 256, 256],
             gamma=0.99,
             clip_ratio=0.2,
             pi_lr=3e-4,
             vf_lr=1e-3,
-            train_pi_iters=5,
-            train_v_iters=5,
+            train_pi_iters=10,
+            train_v_iters=10,
             lam=0.95,
             target_kl=0.01,
             device=device

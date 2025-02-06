@@ -162,13 +162,18 @@ def compute_feature_diversity(features: torch.Tensor, batch_size: int = 32) -> f
     Compute diversity score for features in a memory-efficient way
     
     Args:
-        features: Tensor of shape [N, C, H, W]
+        features: Tensor of shape [B, C, H, W] or [C, H, W]
         batch_size: Size of batches to process at once
     """
-    # Move to CPU and flatten features
-    features = features.cpu()
-    N, C, H, W = features.shape
-    features_flat = features.view(N, -1)  # [N, C*H*W]
+    # Ensure features are batched
+    if features.dim() == 3:
+        features = features.unsqueeze(0)
+    
+    # Get dimensions
+    B, C, H, W = features.shape
+    
+    # Reshape features to [B, C*H*W]
+    features_flat = features.reshape(B, -1)
     
     # Normalize features
     features_flat = F.normalize(features_flat, p=2, dim=1)
@@ -177,13 +182,13 @@ def compute_feature_diversity(features: torch.Tensor, batch_size: int = 32) -> f
     count = 0
     
     # Process in batches to avoid memory issues
-    for i in range(0, N, batch_size):
-        batch_end = min(i + batch_size, N)
+    for i in range(0, B, batch_size):
+        batch_end = min(i + batch_size, B)
         current_batch = features_flat[i:batch_end]
         
         # Compute similarity for current batch with all features
-        for j in range(0, N, batch_size):
-            j_end = min(j + batch_size, N)
+        for j in range(0, B, batch_size):
+            j_end = min(j + batch_size, B)
             other_batch = features_flat[j:j_end]
             
             # Compute batch similarity
@@ -296,16 +301,41 @@ def compute_local_coherence(features: torch.Tensor, kernel_size: int = 3) -> flo
     coherence = -F.mse_loss(features, local_mean)
     return float(coherence.item())
 
-def compute_segmentation_map(features: torch.Tensor) -> torch.Tensor:
-    """Compute segmentation map from feature tensor"""
-    # Assuming features is [B, C, H, W]
-    B, C, H, W = features.shape
+def compute_segmentation_map(w_feats: torch.Tensor, binary_mask: torch.Tensor) -> torch.Tensor:
+    """
+    Compute binary segmentation map from weighted features using simple clustering.
+    Returns a binary (black/white) segmentation map.
+    """
+    # Resize binary mask to match feature size
+    mask_resized = F.interpolate(
+        binary_mask,
+        size=(w_feats.shape[2], w_feats.shape[3]),  # Match feature spatial dimensions
+        mode='nearest'
+    )
     
-    # Average across channels and normalize
-    seg_map = features.mean(dim=1, keepdim=True)  # [B, 1, H, W]
-    seg_map = (seg_map - seg_map.min()) / (seg_map.max() - seg_map.min() + 1e-8)
+    # Apply binary mask to features first
+    w_feats = w_feats * mask_resized  # Now dimensions match
     
-    return seg_map.squeeze(1)  # Return [B, H, W]
+    # Flatten features for clustering
+    feat_flat = w_feats.squeeze(0).permute(1,2,0).reshape(-1, w_feats.size(1))
+    feat_flat = F.normalize(feat_flat, dim=1)
+    
+    # Select two random points as initial centroids
+    N, D = feat_flat.size()
+    idx = torch.randperm(N, device=w_feats.device)[:2]
+    centroids = feat_flat[idx].clone()
+    
+    # Simple 2-means clustering
+    dists = torch.cdist(feat_flat, centroids)
+    clusters = dists.argmin(dim=1)
+    
+    # Reshape back to spatial dimensions - keep binary
+    seg_map = clusters.reshape(w_feats.shape[2], w_feats.shape[3]).float()
+    
+    # Apply binary mask again to ensure masked regions are 0
+    seg_map = seg_map * mask_resized.squeeze()
+    
+    return seg_map
 
 def visualize_map_with_augs(image_tensors: list, 
                            heatmaps: list,
@@ -313,91 +343,64 @@ def visualize_map_with_augs(image_tensors: list,
                            binary_mask: torch.Tensor,
                            reward: float,
                            save_path: str = None):
-    """
-    Creates a grid showing all augmentations and their maps.
-    Args:
-        image_tensors: List of [C,H,W] image tensors
-        heatmaps: List of [H,W] heatmap tensors
-        ground_truth: [H,W] numpy array of ground truth
-        binary_mask: [1,1,H,W] tensor of binary mask
-        reward: float value of current reward
-        save_path: Where to save the visualization
-    """
+    """Creates a grid showing all augmentations and their binary maps."""
     n_images = len(image_tensors)
-    n_cols = 4  # [Image | GT | Map | Overlay]
+    n_cols = 4
     n_rows = n_images
     
     plt.figure(figsize=(20, 5*n_rows))
     
-    # Get target size from first heatmap
-    target_size = heatmaps[0].shape[-2:]  # Get last two dimensions
-    
-    # Prepare binary mask - ensure it's the right shape first
-    if binary_mask.dim() == 2:
-        binary_mask = binary_mask.unsqueeze(0).unsqueeze(0)
-    elif binary_mask.dim() == 3:
-        binary_mask = binary_mask.unsqueeze(0)
-        
-    # Ensure mask is the right size
-    mask = F.interpolate(
+    # Prepare binary mask
+    mask_resized = F.interpolate(
         binary_mask,
-        size=target_size,
+        size=(256, 256),
         mode='nearest'
-    ).squeeze().cpu().numpy()  # Convert to numpy here
+    ).squeeze().cpu().numpy()
     
     for idx, (img, hmap) in enumerate(zip(image_tensors, heatmaps)):
-        # Convert to numpy - handle both 3D and 4D inputs
-        if img.dim() == 4:  # (B,C,H,W)
-            img = img.squeeze(0)  # Remove batch dimension
+        if img.dim() == 4:
+            img = img.squeeze(0)
             
-        # Ensure image is same size as heatmap
+        # Resize image
         img_resized = F.interpolate(
             img.unsqueeze(0), 
-            size=target_size,
+            size=(256, 256),
             mode='bilinear',
             align_corners=False
         ).squeeze(0)
         
-        img_np = img_resized.detach().cpu().permute(1,2,0).numpy()
-        
-        # Handle heatmap dimensions
-        hmap_np = hmap.detach().cpu().numpy()
-        if hmap_np.ndim == 3:  # If [B,H,W]
-            hmap_np = hmap_np.squeeze(0)  # Remove batch dimension
-        
-        # Resize ground truth to match
-        gt_tensor = torch.from_numpy(ground_truth).float().unsqueeze(0).unsqueeze(0)
-        gt_resized = F.interpolate(
-            gt_tensor,
-            size=target_size,
+        # Resize heatmap and apply mask
+        hmap_resized = F.interpolate(
+            hmap.unsqueeze(0).unsqueeze(0),
+            size=(256, 256),
             mode='nearest'
-        ).squeeze().numpy()
+        ).squeeze().detach().cpu().numpy()
+        hmap_resized = hmap_resized * mask_resized  # Apply binary mask
         
-        # Apply mask to heatmap
-        hmap_np = hmap_np * mask  # Element-wise multiplication
+        img_np = img_resized.detach().cpu().permute(1,2,0).numpy()
         
         # Original Image
         plt.subplot(n_rows, n_cols, idx*n_cols + 1)
         plt.imshow(img_np)
-        plt.title(f"{'Original' if idx==0 else f'Augmentation {idx}'}")
+        plt.title(f"{'Original' if idx==0 else f'Aug {idx}'}")
         plt.axis("off")
         
         # Ground Truth
         plt.subplot(n_rows, n_cols, idx*n_cols + 2)
-        plt.imshow(gt_resized, cmap='gray')
+        plt.imshow(ground_truth, cmap='gray')
         plt.title("Ground Truth")
         plt.axis("off")
         
-        # Heatmap
+        # Binary Map (black/white)
         plt.subplot(n_rows, n_cols, idx*n_cols + 3)
-        plt.imshow(hmap_np, cmap='hot')
-        plt.title(f"Segmentation Map (R={reward:.3f})")
+        plt.imshow(hmap_resized, cmap='gray')
+        plt.title(f"Binary Map (R={reward:.3f})")
         plt.axis("off")
         
-        # Overlay
+        # Overlay - using resized versions of both image and heatmap
         plt.subplot(n_rows, n_cols, idx*n_cols + 4)
         plt.imshow(img_np)
-        plt.imshow(hmap_np, cmap='hot', alpha=0.6)
+        plt.imshow(hmap_resized, cmap='gray', alpha=0.6)
         plt.title("Overlay")
         plt.axis("off")
     
