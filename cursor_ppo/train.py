@@ -233,29 +233,24 @@ class FeatureWeightingEnv(gym.Env):
             sample_indices = torch.randint(0, len(self.processed_samples), (self.batch_size,))
             features = self._extract_features(sample_indices)
             
-            # Compute rewards
-            cluster_sep = compute_feature_diversity(features)
+            # Compute individual rewards
+            diversity_reward = compute_feature_diversity(features)
             boundary_reward = compute_boundary_strength(features)
-            feat_div = compute_feature_diversity(features)
             coherence_reward = compute_local_coherence(features)
-            consistency = compute_consistency_reward(features)
-            memory_consistency = compute_consistency_reward(features)
-            contrastive_reward = compute_feature_diversity(features)
+            consistency_reward = compute_consistency_reward(features)
 
-            composite_reward = (
-                0.15 * cluster_sep +      # Cluster separation 
-                0.15 * boundary_reward +  # Edge detection
-                0.15 * feat_div +        # Feature diversity
-                0.15 * coherence_reward + # Local coherence
-                0.25 * consistency +      # Augmentation consistency
-                0.10 * memory_consistency + # Memory bank consistency
-                0.05 * contrastive_reward  # Contrastive learning
+            # Combine rewards with new weights
+            reward = (
+                0.4 * diversity_reward +
+                0.3 * consistency_reward +
+                0.2 * boundary_reward +
+                0.1 * coherence_reward
             )
 
         # Store metrics
-        self.reward_history.append(composite_reward)
-        self.diversity_history.append(feat_div)
-        self.consistency_history.append(consistency)
+        self.reward_history.append(reward)
+        self.diversity_history.append(diversity_reward)
+        self.consistency_history.append(consistency_reward)
         self.boundary_history.append(boundary_reward)
         self.coherence_history.append(coherence_reward)
 
@@ -268,7 +263,7 @@ class FeatureWeightingEnv(gym.Env):
         done = False
         info = {}
 
-        return obs, composite_reward, done, info
+        return obs, reward, done, info
 
     def _render(self):
         """Render current state visualization"""
