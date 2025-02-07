@@ -157,7 +157,7 @@ def compute_cluster_separation_fast(features: torch.Tensor, eps: float = 0.5) ->
     return float(separation.item()), centers
 
 
-def compute_feature_diversity(features: torch.Tensor, batch_size: int = 32) -> float:
+def compute_feature_diversity(features: torch.Tensor, batch_size: int = 64) -> float:
     """
     Compute diversity score for features in a memory-efficient way
     
@@ -181,12 +181,12 @@ def compute_feature_diversity(features: torch.Tensor, batch_size: int = 32) -> f
     total_similarity = 0
     count = 0
     
-    # Process in batches to avoid memory issues
+    # Process in larger batches
     for i in range(0, B, batch_size):
         batch_end = min(i + batch_size, B)
         current_batch = features_flat[i:batch_end]
         
-        # Compute similarity for current batch with all features
+        # Use larger batches for more stable diversity computation
         for j in range(0, B, batch_size):
             j_end = min(j + batch_size, B)
             other_batch = features_flat[j:j_end]

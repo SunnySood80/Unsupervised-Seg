@@ -16,7 +16,7 @@ torch.backends.cudnn.allow_tf32 = True
 #  SmallTransformerEncoder (optional if you need it)
 ###############################################################################
 class SmallTransformerEncoder(nn.Module):
-    def __init__(self, embed_dim=2048, num_heads=8, num_layers=4, rank=None):
+    def __init__(self, embed_dim=1024, num_heads=8, num_layers=4, rank=None):
         super().__init__()
         self.rank = rank if rank is not None else 0
         self.device = torch.device(f'cuda:{self.rank}')
@@ -121,6 +121,55 @@ class FPNDecoder(nn.Module):
         return p1
 
 ###############################################################################
+#  CrossSetAttention
+###############################################################################
+class CrossSetAttention(nn.Module):
+    def __init__(self, embed_dim=256, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.pool = nn.AdaptiveAvgPool2d((32, 32))
+        
+        self.reduced_dim = embed_dim // 2
+        
+        self.q_proj = nn.Linear(embed_dim, self.reduced_dim)
+        self.k_proj = nn.Linear(embed_dim, self.reduced_dim)
+        self.v_proj = nn.Linear(embed_dim, self.reduced_dim)
+        self.out_proj = nn.Linear(self.reduced_dim, embed_dim)
+        
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        
+    def forward(self, x):
+        B, C, H, W = x.shape
+        
+        x_pooled = self.pool(x)
+        _, _, H_pooled, W_pooled = x_pooled.shape
+        
+        x_flat = x_pooled.reshape(B, C, -1).transpose(1, 2)
+        x_norm = self.norm1(x_flat)
+        
+        q = self.q_proj(x_norm).reshape(B, H_pooled*W_pooled, self.num_heads, -1).transpose(1, 2)
+        k = self.k_proj(x_norm).reshape(B, H_pooled*W_pooled, self.num_heads, -1).transpose(1, 2)
+        v = self.v_proj(x_norm).reshape(B, H_pooled*W_pooled, self.num_heads, -1).transpose(1, 2)
+        
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn, dim=-1)
+        
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).reshape(B, H_pooled*W_pooled, self.reduced_dim)
+        
+        out = self.out_proj(out)
+        out = self.norm2(out + x_flat)
+        
+        out = out.transpose(1, 2).reshape(B, C, H_pooled, W_pooled)
+        out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
+        
+        return out
+
+###############################################################################
 #  HybridResNet50FPN
 ###############################################################################
 class HybridResNet50FPN(nn.Module):
@@ -159,6 +208,12 @@ class HybridResNet50FPN(nn.Module):
             rank=self.rank
         )
         
+        # Add cross-set attention after transformer
+        self.cross_attention = CrossSetAttention(
+            embed_dim=out_channels,
+            num_heads=4
+        )
+        
         # Feature caching
         self.feature_cache = {}
         self.cache_size_limit = 1000
@@ -183,6 +238,9 @@ class HybridResNet50FPN(nn.Module):
         
         # FPN decoder
         p1 = self.fpn(x1, x2, x3)
+        
+        # Apply cross-set attention
+        p1 = self.cross_attention(p1)
 
         # Cache result
         if len(self.feature_cache) >= self.cache_size_limit:

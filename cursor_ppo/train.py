@@ -12,6 +12,8 @@ import datetime
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import socket
+import math
+import sys
 
 # Local imports
 from load_data import load_processed_samples
@@ -35,25 +37,35 @@ binary_mask = F.interpolate(
 ).to('cuda')
 
 def setup_ddp(rank, world_size):
-    """Setup DDP with fixed port and better error handling"""
+    """Setup DDP with increased timeout and better error handling"""
     try:
         print(f"[train.py] setup_ddp called. rank={rank}, world_size={world_size}")
         
         # Use fixed port but different for each run
         base_port = 29500
-        os.environ['MASTER_ADDR'] = '127.0.0.1'  # Use loopback IP instead of localhost
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
         os.environ['MASTER_PORT'] = str(base_port + rank)
         
-        # Initialize process group with timeout
+        # Increase timeout and add NCCL configurations
+        os.environ["NCCL_DEBUG"] = "INFO"
+        os.environ["NCCL_SOCKET_TIMEOUT"] = "300"
+        os.environ["NCCL_IB_TIMEOUT"] = "300"
+        
+        # Initialize process group with increased timeout
         dist.init_process_group(
             backend='nccl',
             init_method=f'tcp://127.0.0.1:{base_port}',
             world_size=world_size,
             rank=rank,
-            timeout=datetime.timedelta(seconds=60)
+            timeout=datetime.timedelta(minutes=5)  # Increased from 60 seconds to 5 minutes
         )
         
-        # Set device
+        # Set device and CUDA settings
+        torch.cuda.set_device(rank)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        
+        # Set NCCL to use the same device as PyTorch
         torch.cuda.set_device(rank)
         
         print(f"[train.py] init_process_group done for rank={rank}.")
@@ -71,6 +83,49 @@ def cleanup_ddp(rank):
             print(f"[train.py] [Rank={rank}] cleanup_ddp done.")
     except Exception as e:
         print(f"[train.py] [Rank={rank}] Error in cleanup_ddp: {str(e)}")
+
+def compute_cross_set_consistency(features: torch.Tensor, batch_size: int) -> float:
+    """
+    Compute consistency using cross-attention between different images in the batch
+    
+    Args:
+        features: Tensor of shape [B, C, H, W] - batch of feature maps
+        batch_size: Size of image sets to compare
+    """
+    B, C, H, W = features.shape
+    
+    # Reshape features for attention
+    flat_features = features.view(B, C, -1)  # [B, C, H*W]
+    
+    # Split batch into sets
+    set_similarities = []
+    for i in range(0, B, batch_size):
+        set1 = flat_features[i:i+batch_size]  # First set of images
+        
+        # Compare with other sets
+        for j in range(0, B, batch_size):
+            if i == j:  # Skip self-comparison
+                continue
+                
+            set2 = flat_features[j:j+batch_size]
+            
+            # Compute cross-attention between sets
+            # Scale dot product attention
+            attention = torch.bmm(set1.transpose(1, 2), set2) / math.sqrt(C)  # [batch_size, H*W, H*W]
+            attention_weights = F.softmax(attention, dim=-1)
+            
+            # Apply attention to get attended features
+            attended_features = torch.bmm(attention_weights, set2.transpose(1, 2))  # [batch_size, H*W, C]
+            
+            # Compute similarity between original and attended features
+            similarity = F.cosine_similarity(
+                set1.transpose(1, 2).reshape(-1, C),
+                attended_features.reshape(-1, C)
+            ).mean()
+            
+            set_similarities.append(similarity)
+    
+    return torch.stack(set_similarities).mean().item()
 
 ###############################################################################
 #  FeatureWeightingEnv
@@ -239,7 +294,7 @@ class FeatureWeightingEnv(gym.Env):
             coherence_reward = compute_local_coherence(features)
             consistency_reward = compute_consistency_reward(features)
 
-            # Combine rewards with new weights
+            # Combine rewards with weights
             reward = (
                 0.4 * diversity_reward +
                 0.3 * consistency_reward +
@@ -319,9 +374,9 @@ def train_ddp(rank, world_size, processed_samples):
         if rank == 0:
             os.makedirs('final_visuals', exist_ok=True)
         
-        # Reduce memory usage per GPU
-        per_gpu_batch_size = 256 
-        n_steps = 1024 // world_size
+        # Reduce batch size and steps to lower memory usage
+        per_gpu_batch_size = 128  # Reduced from 256
+        n_steps = 512 // world_size  # Reduced from 1024
         
         # Create environment
         feature_extractor = FilterWeightingSegmenter(pretrained=True).to(device)
@@ -348,8 +403,8 @@ def train_ddp(rank, world_size, processed_samples):
             env=env,
             n_steps=n_steps,
             batch_size=1024,
-            policy_hidden_sizes=[512, 512, 512],  # Adjusted network sizes
-            value_hidden_sizes=[512, 256, 256],
+            policy_hidden_sizes=[2048, 1024, 512],  # Larger policy network
+            value_hidden_sizes=[1024, 512, 256],    # Larger value network
             gamma=0.95,
             clip_ratio=0.15,
             pi_lr=3e-4,
@@ -370,36 +425,79 @@ def train_ddp(rank, world_size, processed_samples):
             print(f"Steps per GPU: {n_steps}")
             print(f"Batch size per GPU: {per_gpu_batch_size}\n")
 
-        # Training loop with error handling
+        # Training loop with better synchronization
+        start_time = time.time()
         total_frames = 0
         total_timesteps = 10_000
         episode_count = 0
         
+        # Initialize metrics
+        metrics = None
+        
         while total_frames < total_timesteps:
-            dist.barrier()
-            
             try:
+                # Synchronize before training step
+                torch.cuda.synchronize(device)
+                dist.barrier()
+                
                 if rank == 0:
                     pbar = tqdm(total=n_steps, desc=f"Episode {episode_count}", leave=False)
                 
-                with torch.amp.autocast('cuda'):  # Fixed deprecated warning
-                    episode_start = time.time()
-                    metrics = agent.learn(total_timesteps=n_steps, pbar=pbar if rank == 0 else None)
+                # Run training step
+                metrics = agent.learn(total_timesteps=n_steps, pbar=pbar if rank == 0 else None)
+                
+                # Synchronize after training step
+                torch.cuda.synchronize(device)
+                dist.barrier()
                 
                 torch.cuda.empty_cache()
                 
                 if metrics is not None:
                     total_frames += n_steps
                     episode_count += 1
-                    # ... rest of metrics printing ...
+                    
+                    # Print metrics only from rank 0
+                    if rank == 0:
+                        elapsed_time = time.time() - start_time
+                        fps = total_frames / elapsed_time
+                        
+                        # Convert rewards to numpy if they're tensors
+                        rewards = agent.buffer.rews
+                        if isinstance(rewards, torch.Tensor):
+                            rewards = rewards.cpu().numpy()
+                        
+                        print("\n" + "="*50)
+                        print(f"Episode {episode_count} Summary:")
+                        print("="*50)
+                        print(f"Steps this episode: {n_steps}")
+                        print(f"Total steps: {total_frames}")
+                        print(f"FPS: {fps:.2f}")
+                        print(f"Time elapsed: {datetime.timedelta(seconds=int(elapsed_time))}")
+                        print("\nTraining Metrics:")
+                        print(f"Policy Loss: {metrics['pi_loss']:.4f}")
+                        print(f"Value Loss: {metrics['v_loss']:.4f}")
+                        print(f"Policy KL: {metrics['policy_kl']:.4f}")
+                        print(f"Clip Fraction: {metrics['clip_frac']:.4f}")
+                        print("\nReward Statistics:")
+                        print(f"Average Reward: {np.mean(rewards):.4f}")
+                        print(f"Std Reward: {np.std(rewards):.4f}")
+                        print(f"Max Reward: {np.max(rewards):.4f}")
+                        print(f"Min Reward: {np.min(rewards):.4f}")
+                        print("="*50 + "\n")
+                        
+                        # Ensure printing
+                        sys.stdout.flush()
 
             except RuntimeError as e:
                 print(f"\nError on rank {rank}: {str(e)}")
-                torch.cuda.empty_cache()
                 if "CUDA out of memory" in str(e):
+                    torch.cuda.empty_cache()
                     continue
                 else:
                     raise
+            except Exception as e:
+                print(f"\nUnexpected error on rank {rank}: {str(e)}")
+                raise
 
     except Exception as e:
         print(f"Error on rank {rank}: {str(e)}")
