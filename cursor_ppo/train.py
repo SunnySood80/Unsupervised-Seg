@@ -320,8 +320,8 @@ def train_ddp(rank, world_size, processed_samples):
             os.makedirs('final_visuals', exist_ok=True)
         
         # Reduce memory usage per GPU
-        per_gpu_batch_size = 128 
-        n_steps = 512 // world_size
+        per_gpu_batch_size = 256 
+        n_steps = 1024 // world_size
         
         # Create environment
         feature_extractor = FilterWeightingSegmenter(pretrained=True).to(device)
@@ -347,15 +347,15 @@ def train_ddp(rank, world_size, processed_samples):
         agent = PPO(
             env=env,
             n_steps=n_steps,
-            batch_size=512,
+            batch_size=1024,
             policy_hidden_sizes=[512, 512, 512],  # Adjusted network sizes
             value_hidden_sizes=[512, 256, 256],
-            gamma=0.99,
-            clip_ratio=0.2,
+            gamma=0.95,
+            clip_ratio=0.15,
             pi_lr=3e-4,
             vf_lr=1e-3,
-            train_pi_iters=10,
-            train_v_iters=10,
+            train_pi_iters=15,
+            train_v_iters=15,
             lam=0.95,
             target_kl=0.01,
             device=device
@@ -372,7 +372,7 @@ def train_ddp(rank, world_size, processed_samples):
 
         # Training loop with error handling
         total_frames = 0
-        total_timesteps = 1000
+        total_timesteps = 10_000
         episode_count = 0
         
         while total_frames < total_timesteps:
