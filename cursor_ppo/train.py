@@ -375,7 +375,7 @@ def train_ddp(rank, world_size, processed_samples):
             os.makedirs('final_visuals', exist_ok=True)
         
         # Reduce batch size and steps to lower memory usage
-        per_gpu_batch_size = 128  # Reduced from 256
+        per_gpu_batch_size = 96  # Reduced from 256
         n_steps = 512 // world_size  # Reduced from 1024
         
         # Create environment
@@ -394,7 +394,7 @@ def train_ddp(rank, world_size, processed_samples):
             device=device,
             batch_size=per_gpu_batch_size,
             enable_render=(rank == 0),
-            render_patience=50,
+            render_patience=150,
             visualize=True
         )
 

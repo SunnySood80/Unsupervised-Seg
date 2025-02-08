@@ -89,50 +89,63 @@ def compute_cluster_separation_fast(features: torch.Tensor, eps: float = 0.5) ->
     feat_flat = features.reshape(-1, features.size(-1))
     feat_norm = F.normalize(feat_flat, dim=1)
     
-    # Use chunked distance computation to save memory
-    chunk_size = 1024
+    # Use larger chunks and compute distances more efficiently
+    chunk_size = 2048  # Increased chunk size
     N = feat_norm.size(0)
     core_points = torch.zeros(N, dtype=torch.bool, device=features.device)
     
+    # Pre-allocate distance matrix for chunks
     for i in range(0, N, chunk_size):
         end = min(i + chunk_size, N)
-        chunk_dists = torch.cdist(feat_norm[i:end], feat_norm)
+        # Use matmul for distance computation (more efficient than cdist for this case)
+        chunk = feat_norm[i:end]
+        sim_matrix = torch.mm(chunk, feat_norm.t())
+        # Convert similarities to distances: dist = sqrt(2 - 2*sim) for normalized vectors
+        chunk_dists = torch.sqrt(torch.clamp(2 - 2 * sim_matrix, min=0))
         core_points[i:end] = (chunk_dists <= eps).sum(1) >= 4
     
     if not core_points.any():
         return 0.0, torch.zeros(2, feat_flat.size(1), device=features.device)
     
-    # Fast cluster assignment using connected components
+    # Optimize cluster assignment
     labels = -torch.ones(N, device=features.device)
     current_label = 0
     
-    for i in torch.where(core_points)[0]:
+    # Process core points in batches
+    core_indices = torch.where(core_points)[0]
+    for i in core_indices:
         if labels[i] >= 0:
             continue
-            
-        # Find cluster in one shot using matrix operations
-        cluster_mask = torch.cdist(feat_norm[i:i+1], feat_norm) <= eps
-        labels[cluster_mask[0]] = current_label
+        
+        # Compute similarities in one shot using matmul
+        sim = torch.mm(feat_norm[i:i+1], feat_norm.t())
+        dists = torch.sqrt(torch.clamp(2 - 2 * sim, min=0))
+        cluster_mask = dists[0] <= eps
+        
+        labels[cluster_mask] = current_label
         current_label += 1
         
-        if current_label >= 2:  # Early exit if we have enough clusters
+        if current_label >= 2:  # Early exit
             break
     
     if current_label < 2:
         return 0.0, torch.zeros(2, feat_flat.size(1), device=features.device)
     
-    # Fast center computation using matrix operations
+    # Optimize center computation
     centers = []
     for i in range(2):
         mask = labels == i
         if mask.any():
-            center = feat_norm[mask].mean(0, keepdim=True)
+            # Use index_select instead of boolean masking
+            cluster_points = feat_norm.index_select(0, torch.where(mask)[0])
+            center = cluster_points.mean(0, keepdim=True)
             centers.append(F.normalize(center, dim=1))
         else:
             centers.append(torch.zeros(1, feat_flat.size(1), device=features.device))
     
     centers = torch.cat(centers, dim=0)
-    separation = torch.cdist(centers, centers)[0, 1]
+    # Use direct computation instead of cdist for 2x2 case
+    separation = torch.sqrt(torch.sum((centers[0] - centers[1]) ** 2))
     
     return float(separation.item()), centers
 
@@ -265,38 +278,31 @@ def compute_local_coherence(features: torch.Tensor, kernel_size: int = 3) -> flo
     return float(-F.mse_loss(features, local_mean).item())
 
 def compute_segmentation_map(w_feats: torch.Tensor, binary_mask: torch.Tensor) -> torch.Tensor:
-    """
-    Compute binary segmentation map from weighted features using simple clustering.
-    Returns a binary (black/white) segmentation map.
-    """
-    # Resize binary mask to match feature size
+    """Optimized segmentation map computation"""
+    # Resize binary mask once
     mask_resized = F.interpolate(
         binary_mask,
-        size=(w_feats.shape[2], w_feats.shape[3]),  # Match feature spatial dimensions
+        size=(w_feats.shape[2], w_feats.shape[3]),
         mode='nearest'
     )
     
-    # Apply binary mask to features first
-    w_feats = w_feats * mask_resized  # Now dimensions match
-    
-    # Flatten features for clustering
-    feat_flat = w_feats.squeeze(0).permute(1,2,0).reshape(-1, w_feats.size(1))
+    # Apply mask and normalize in one step
+    masked_feats = w_feats * mask_resized
+    feat_flat = masked_feats.squeeze(0).permute(1,2,0).reshape(-1, w_feats.size(1))
     feat_flat = F.normalize(feat_flat, dim=1)
     
-    # Select two random points as initial centroids
-    N, D = feat_flat.size()
+    # Efficient centroid selection and clustering
+    N = feat_flat.size(0)
     idx = torch.randperm(N, device=w_feats.device)[:2]
-    centroids = feat_flat[idx].clone()
+    centroids = feat_flat[idx]
     
-    # Simple 2-means clustering
-    dists = torch.cdist(feat_flat, centroids)
+    # Single matrix multiplication for all distances
+    dists = torch.mm(feat_flat, centroids.t())
     clusters = dists.argmin(dim=1)
     
-    # Reshape back to spatial dimensions - keep binary
+    # Efficient reshaping and masking
     seg_map = clusters.reshape(w_feats.shape[2], w_feats.shape[3]).float()
-    
-    # Apply binary mask again to ensure masked regions are 0
-    seg_map = seg_map * mask_resized.squeeze()
+    seg_map.mul_(mask_resized.squeeze())
     
     return seg_map
 
