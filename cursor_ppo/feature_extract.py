@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast
-from torchvision import models
+import timm
 from torch.utils.checkpoint import checkpoint
 import torch.distributed as dist
 from functools import lru_cache
@@ -16,7 +16,7 @@ torch.backends.cudnn.allow_tf32 = True
 #  SmallTransformerEncoder (optional if you need it)
 ###############################################################################
 class SmallTransformerEncoder(nn.Module):
-    def __init__(self, embed_dim=1024, num_heads=8, num_layers=4, rank=None):
+    def __init__(self, embed_dim=2048, num_heads=8, num_layers=4, rank=None):
         super().__init__()
         self.rank = rank if rank is not None else 0
         self.device = torch.device(f'cuda:{self.rank}')
@@ -174,41 +174,44 @@ class CrossSetAttention(nn.Module):
 ###############################################################################
 class HybridResNet50FPN(nn.Module):
     """
-    A ResNet50-based feature extractor with a simple FPN top-down pathway.
+    An EfficientNetV2-B0-based feature extractor with a simple FPN top-down pathway.
     """
     def __init__(self, pretrained=True, out_channels=256, rank=None):
         super().__init__()
         self.rank = rank if rank is not None else 0
         
-        # Initialize ResNet50 backbone
-        weights = models.ResNet50_Weights.IMAGENET1K_V1 if pretrained else None
-        base_resnet = models.resnet50(weights=weights)
-        base_resnet = base_resnet.to(memory_format=torch.channels_last)
-        
-        # Freeze backbone parameters
-        for param in base_resnet.parameters():
-            param.requires_grad = False
-        
-        # Extract layers
-        self.stem = nn.Sequential(
-            base_resnet.conv1,
-            base_resnet.bn1,
-            base_resnet.relu,
-            base_resnet.maxpool
+        # Initialize backbone with timm in features_only mode
+        self.backbone = timm.create_model(
+            'tf_efficientnetv2_b0', 
+            pretrained=pretrained, 
+            features_only=True,
+            out_indices=(1, 2, 3)  # Get features from multiple stages
         )
-        self.layer1 = base_resnet.layer1  # 256 channels
-        self.layer2 = base_resnet.layer2  # 512 channels
-        self.layer3 = base_resnet.layer3  # 1024 channels
+        
+        # Get the feature dimensions from a dummy forward pass
+        dummy = torch.randn(1, 3, 224, 224)
+        features = self.backbone(dummy)
+        
+        # Features is a list of tensors at different scales
+        # Each with progressively more channels and smaller spatial dimensions
+        c1, c2, c3 = [feat.shape[1] for feat in features]
+        
+        # Create 1x1 convs to adjust channel dimensions if needed
+        self.adjust1 = nn.Conv2d(c1, out_channels, 1) if c1 != out_channels else nn.Identity()
+        self.adjust2 = nn.Conv2d(c2, out_channels, 1) if c2 != out_channels else nn.Identity()
+        self.adjust3 = nn.Conv2d(c3, out_channels, 1) if c3 != out_channels else nn.Identity()
 
-        # Add transformer and FPN
-        self.transformer = SmallTransformerEncoder(embed_dim=1024, rank=self.rank)
+        # Adjust transformer input dimension for final feature map size
+        self.transformer = SmallTransformerEncoder(embed_dim=out_channels, rank=self.rank)
+        
+        # FPN decoder with adjusted channels
         self.fpn = FPNDecoder(
-            in_channels_list=(256, 512, 1024),
+            in_channels_list=(out_channels, out_channels, out_channels),
             out_channels=out_channels,
             rank=self.rank
         )
         
-        # Add cross-set attention after transformer
+        # Cross-attention remains the same
         self.cross_attention = CrossSetAttention(
             embed_dim=out_channels,
             num_heads=4
@@ -225,13 +228,14 @@ class HybridResNet50FPN(nn.Module):
         if cache_key in self.feature_cache:
             return self.feature_cache[cache_key]
 
-        x = x.contiguous(memory_format=torch.channels_last)
+        # Get multi-scale features from backbone
+        features = self.backbone(x)
+        x1, x2, x3 = features
         
-        # Extract features
-        x = self.stem(x)
-        x1 = self.layer1(x)    # 256 channels
-        x2 = self.layer2(x1)   # 512 channels
-        x3 = self.layer3(x2)   # 1024 channels
+        # Adjust channel dimensions
+        x1 = self.adjust1(x1)
+        x2 = self.adjust2(x2)
+        x3 = self.adjust3(x3)
 
         # Apply transformer to high-level features
         x3 = self.transformer(x3)

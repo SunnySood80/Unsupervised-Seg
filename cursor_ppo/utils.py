@@ -13,6 +13,7 @@ import csv
 import os
 import copy
 from feature_extract import DDPFeatureExtractor
+import timm
 
 # Define Sobel filters as constants
 SOBEL_X = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).reshape(1, 1, 3, 3)
@@ -26,8 +27,8 @@ class MomentumEncoder:
         if isinstance(model, DDPFeatureExtractor):
             print("Creating momentum encoder for DDP model...")
             self.ema_model = DDPFeatureExtractor(
-                world_size=model.world_size,
-                start_gpu=model.start_gpu
+                pretrained=True,
+                out_channels=256
             )
             # Copy state dict instead of deep copying
             self.ema_model.load_state_dict(model.state_dict())
@@ -377,3 +378,6 @@ def visualize_map_with_augs(image_tensors: list,
     if save_path:
         plt.savefig(save_path)
     plt.close()
+
+# Then use it as:
+model = timm.create_model('tf_efficientnetv2_b0', pretrained=True)

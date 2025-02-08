@@ -14,6 +14,7 @@ from tqdm import tqdm
 import socket
 import math
 import sys
+import timm
 
 # Local imports
 from load_data import load_processed_samples
@@ -35,6 +36,10 @@ binary_mask = F.interpolate(
     size=(256, 256),
     mode='nearest'
 ).to('cuda')
+
+"""
+An EfficientNetV2-B0-based feature extractor with FPN pathway.
+"""
 
 def setup_ddp(rank, world_size):
     """Setup DDP with increased timeout and better error handling"""
@@ -607,3 +612,5 @@ def train_custom_ppo():
 
 if __name__ == "__main__":
     train_custom_ppo()
+
+print(timm.list_models('*efficientnet*'))
