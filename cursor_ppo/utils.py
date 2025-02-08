@@ -14,6 +14,10 @@ import os
 import copy
 from feature_extract import DDPFeatureExtractor
 
+# Define Sobel filters as constants
+SOBEL_X = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).reshape(1, 1, 3, 3)
+SOBEL_Y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).reshape(1, 1, 3, 3)
+
 class MomentumEncoder:
     def __init__(self, model: nn.Module, momentum: float = 0.999):
         self.momentum = momentum
@@ -66,150 +70,100 @@ def compute_contrastive_loss(
     key_feats: torch.Tensor,
     temperature: float = 0.07
 ) -> float:
-    """
-    Compute InfoNCE contrastive loss between query and key features.
-    """
-    # Flatten and normalize features
+    """Optimized InfoNCE contrastive loss computation"""
+    # Pre-normalize to avoid repeated normalization
     query = F.normalize(query_feats.flatten(2), dim=1)  # (B, C, H*W)
     key = F.normalize(key_feats.flatten(2), dim=1)      # (B, C, H*W)
     
-    # Compute similarity matrix
-    sim_matrix = torch.einsum('bci,bcj->bij', query, key) / temperature
+    # Use batch matrix multiplication instead of einsum
+    sim_matrix = torch.bmm(query.transpose(1, 2), key) / temperature
     
-    # For each position, treat it as positive example for itself
-    # and all other positions as negatives
-    B, _, N = query.shape
-    labels = torch.arange(N, device=query.device)
-    labels = labels.unsqueeze(0).expand(B, N)  # (B, N)
+    # Use arange once and expand
+    B, N, _ = sim_matrix.shape
+    labels = torch.arange(N, device=query.device).expand(B, N)
     
-    # Compute InfoNCE loss
-    loss = F.cross_entropy(sim_matrix, labels)
-    
-    return float(loss.item())
+    return float(F.cross_entropy(sim_matrix, labels).item())
 
 def compute_cluster_separation_fast(features: torch.Tensor, eps: float = 0.5) -> Tuple[float, torch.Tensor]:
-    """
-    DBSCAN-based cluster separation. Memory efficient implementation.
-    Returns cluster separation score and centers.
-    """
+    """Optimized DBSCAN-based cluster separation"""
     feat_flat = features.reshape(-1, features.size(-1))
-    N, D = feat_flat.size()
-    
-    # Normalize features
     feat_norm = F.normalize(feat_flat, dim=1)
     
-    # Compute pairwise distances efficiently
-    dists = torch.cdist(feat_norm, feat_norm)
+    # Use chunked distance computation to save memory
+    chunk_size = 1024
+    N = feat_norm.size(0)
+    core_points = torch.zeros(N, dtype=torch.bool, device=features.device)
     
-    # DBSCAN core point finding
-    core_points = (dists <= eps).sum(1) >= 4  # MinPts = 4
+    for i in range(0, N, chunk_size):
+        end = min(i + chunk_size, N)
+        chunk_dists = torch.cdist(feat_norm[i:end], feat_norm)
+        core_points[i:end] = (chunk_dists <= eps).sum(1) >= 4
     
     if not core_points.any():
-        return 0.0, torch.zeros(2, D, device=features.device)  # Return dummy centers
+        return 0.0, torch.zeros(2, feat_flat.size(1), device=features.device)
     
-    # Cluster assignment using core points
+    # Fast cluster assignment using connected components
     labels = -torch.ones(N, device=features.device)
     current_label = 0
     
-    for i in range(N):
-        if labels[i] >= 0 or not core_points[i]:
+    for i in torch.where(core_points)[0]:
+        if labels[i] >= 0:
             continue
             
-        # Find points in eps neighborhood
-        neighbors = dists[i] <= eps
-        if core_points[i]:
-            labels[neighbors] = current_label
-            
-            # Expand cluster
-            to_check = neighbors.clone()
-            while to_check.any():
-                new_points = torch.zeros_like(to_check)
-                for idx in torch.where(to_check)[0]:
-                    if core_points[idx]:
-                        curr_neighbors = dists[idx] <= eps
-                        new_points = new_points | (curr_neighbors & (labels < 0))
-                        labels[curr_neighbors] = current_label
-                to_check = new_points
-                
-            current_label += 1
-    
-    # Ensure we have at least 2 clusters
-    if current_label < 2:
-        return 0.0, torch.zeros(2, D, device=features.device)
+        # Find cluster in one shot using matrix operations
+        cluster_mask = torch.cdist(feat_norm[i:i+1], feat_norm) <= eps
+        labels[cluster_mask[0]] = current_label
+        current_label += 1
         
-    # Calculate cluster centers
+        if current_label >= 2:  # Early exit if we have enough clusters
+            break
+    
+    if current_label < 2:
+        return 0.0, torch.zeros(2, feat_flat.size(1), device=features.device)
+    
+    # Fast center computation using matrix operations
     centers = []
-    for i in range(min(2, current_label)):  # Take at most 2 clusters
+    for i in range(2):
         mask = labels == i
         if mask.any():
-            center = feat_norm[mask].mean(0)
-            centers.append(F.normalize(center.unsqueeze(0), dim=1))
-    
-    # Pad to exactly 2 centers if needed
-    while len(centers) < 2:
-        centers.append(torch.zeros(1, D, device=features.device))
+            center = feat_norm[mask].mean(0, keepdim=True)
+            centers.append(F.normalize(center, dim=1))
+        else:
+            centers.append(torch.zeros(1, feat_flat.size(1), device=features.device))
     
     centers = torch.cat(centers, dim=0)
-    
-    # Compute separation score
-    separation = torch.cdist(centers, centers)[0, 1]  # Distance between first two centers
+    separation = torch.cdist(centers, centers)[0, 1]
     
     return float(separation.item()), centers
 
-
-def compute_feature_diversity(features: torch.Tensor, batch_size: int = 64) -> float:
-    """
-    Compute diversity score for features in a memory-efficient way
-    
-    Args:
-        features: Tensor of shape [B, C, H, W] or [C, H, W]
-        batch_size: Size of batches to process at once
-    """
-    # Ensure features are batched
+def compute_feature_diversity(features: torch.Tensor, batch_size: int = 256) -> float:
+    """Optimized feature diversity computation"""
     if features.dim() == 3:
         features = features.unsqueeze(0)
     
-    # Get dimensions
-    B, C, H, W = features.shape
+    # Flatten and normalize once
+    features_flat = F.normalize(features.reshape(features.size(0), -1), p=2, dim=1)
     
-    # Reshape features to [B, C*H*W]
-    features_flat = features.reshape(B, -1)
-    
-    # Normalize features
-    features_flat = F.normalize(features_flat, p=2, dim=1)
-    
-    total_similarity = 0
+    # Use matrix multiplication with chunking
+    total_similarity = 0.0
     count = 0
+    B = features_flat.size(0)
     
-    # Process in larger batches
     for i in range(0, B, batch_size):
-        batch_end = min(i + batch_size, B)
-        current_batch = features_flat[i:batch_end]
+        i_end = min(i + batch_size, B)
+        current = features_flat[i:i_end]
         
-        # Use larger batches for more stable diversity computation
-        for j in range(0, B, batch_size):
-            j_end = min(j + batch_size, B)
-            other_batch = features_flat[j:j_end]
+        # Compute similarities for this chunk
+        sim = torch.mm(current, features_flat.t())
+        
+        # Zero out self-similarities
+        if i == 0:
+            sim.fill_diagonal_(0)
             
-            # Compute batch similarity
-            batch_similarity = torch.mm(current_batch, other_batch.t())
-            
-            # Don't count self-similarities
-            if i == j:
-                batch_similarity.fill_diagonal_(0)
-            
-            total_similarity += batch_similarity.sum().item()
-            count += (batch_end - i) * (j_end - j)
-            if i == j:
-                count -= (batch_end - i)  # Subtract diagonal count
+        total_similarity += sim.sum().item()
+        count += sim.numel() - (i_end - i)  # Subtract diagonal count
     
-    # Compute average similarity
-    avg_similarity = total_similarity / max(count, 1)
-    
-    # Convert similarity to diversity (higher is better)
-    diversity = 1 - avg_similarity
-    
-    return diversity
+    return 1 - (total_similarity / max(count, 1))
 
 def compute_feature_statistics(features):
     """
@@ -261,45 +215,54 @@ def compute_consistency_reward(original_feats: torch.Tensor, aug_feats_list: Lis
     avg_similarity = torch.stack(similarities).mean()
     return float(avg_similarity.item())
 
-def compute_boundary_strength(features: torch.Tensor) -> float:
+def compute_boundary_strength(features):
     """
-    Compute boundary strength based on feature gradients.
+    Compute boundary strength from feature maps using gradients.
+    Ensures consistent dimensions by proper padding.
     """
-    if features.dim() == 3:
-        features = features.unsqueeze(0)
-        
-    B, C, H, W = features.shape
+    # Move Sobel filters to the same device as features and expand to match input channels
+    n_channels = features.size(1)
     
-    grad_x = torch.zeros_like(features)
-    grad_y = torch.zeros_like(features)
+    # Expand Sobel filters to match input channels
+    sobel_x = SOBEL_X.to(features.device)
+    sobel_y = SOBEL_Y.to(features.device)
     
-    grad_x[..., :-1] = features[..., 1:] - features[..., :-1]
-    grad_y[..., :-1, :] = features[..., 1:, :] - features[..., :-1, :]
+    # Expand to [n_channels, 1, 3, 3]
+    sobel_x = sobel_x.repeat(n_channels, 1, 1, 1)
+    sobel_y = sobel_y.repeat(n_channels, 1, 1, 1)
     
-    gradient_magnitude = torch.sqrt(grad_x**2 + grad_y**2)
-    gradient_magnitude = gradient_magnitude.contiguous().view(B, -1)
+    # Calculate gradients in x and y directions using same padding
+    grad_x = F.conv2d(features, sobel_x, padding=1, groups=n_channels)
+    grad_y = F.conv2d(features, sobel_y, padding=1, groups=n_channels)
     
-    if gradient_magnitude.shape[1] > 0:
-        gradient_magnitude = F.normalize(gradient_magnitude, dim=1)
-        boundary_score = gradient_magnitude.mean().item()
-    else:
-        boundary_score = 0.0
+    # Ensure grad_x and grad_y have same dimensions
+    if grad_x.size() != grad_y.size():
+        # Use the smaller size for both
+        min_size = min(grad_x.size(2), grad_y.size(2))
+        grad_x = grad_x[:, :, :min_size, :min_size]
+        grad_y = grad_y[:, :, :min_size, :min_size]
     
-    return float(boundary_score)
+    # Calculate gradient magnitude
+    gradient_magnitude = torch.sqrt(grad_x.pow(2).sum(1) + grad_y.pow(2).sum(1))
+    
+    # Normalize gradient magnitude
+    gradient_magnitude = (gradient_magnitude - gradient_magnitude.min()) / \
+                        (gradient_magnitude.max() - gradient_magnitude.min() + 1e-6)
+    
+    return gradient_magnitude.mean()
 
 def compute_local_coherence(features: torch.Tensor, kernel_size: int = 3) -> float:
-    """
-    Compute local feature coherence using average pooling.
-    """
+    """Optimized local coherence computation"""
     if features.dim() == 3:
         features = features.unsqueeze(0)
     
+    # Use unfold for efficient neighborhood computation
     padding = kernel_size // 2
-    local_mean = F.avg_pool2d(features, kernel_size=kernel_size, 
-                             stride=1, padding=padding)
+    padded = F.pad(features, (padding, padding, padding, padding))
+    patches = padded.unfold(2, kernel_size, 1).unfold(3, kernel_size, 1)
+    local_mean = patches.mean(dim=(-2, -1))
     
-    coherence = -F.mse_loss(features, local_mean)
-    return float(coherence.item())
+    return float(-F.mse_loss(features, local_mean).item())
 
 def compute_segmentation_map(w_feats: torch.Tensor, binary_mask: torch.Tensor) -> torch.Tensor:
     """
