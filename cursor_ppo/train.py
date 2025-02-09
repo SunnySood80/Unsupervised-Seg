@@ -14,7 +14,6 @@ from tqdm import tqdm
 import socket
 import math
 import sys
-import timm
 
 # Local imports
 from load_data import load_processed_samples
@@ -36,10 +35,6 @@ binary_mask = F.interpolate(
     size=(256, 256),
     mode='nearest'
 ).to('cuda')
-
-"""
-An EfficientNetV2-B0-based feature extractor with FPN pathway.
-"""
 
 def setup_ddp(rank, world_size):
     """Setup DDP with increased timeout and better error handling"""
@@ -253,7 +248,7 @@ class FeatureWeightingEnv(gym.Env):
         self.coherence_history = []
         
         # Reset step counter
-        self.total_steps = 0
+        #self.total_steps = 0
         
         # Get initial observation
         obs = self._get_observation()
@@ -380,8 +375,8 @@ def train_ddp(rank, world_size, processed_samples):
             os.makedirs('final_visuals', exist_ok=True)
         
         # Reduce batch size and steps to lower memory usage
-        per_gpu_batch_size = 128  # Reduced from 256
-        n_steps = 512 // world_size  # Reduced from 1024
+        per_gpu_batch_size = 1024  # Reduced from 256
+        n_steps = 32 // world_size  # Reduced from 1024
         
         # Create environment
         feature_extractor = FilterWeightingSegmenter(pretrained=True).to(device)
@@ -399,33 +394,21 @@ def train_ddp(rank, world_size, processed_samples):
             device=device,
             batch_size=per_gpu_batch_size,
             enable_render=(rank == 0),
-            render_patience=50,
+            render_patience=10,
             visualize=True
         )
 
-        # Initial learning rates
-        initial_pi_lr = 3e-4
-        initial_vf_lr = 1e-3
-        current_pi_lr = initial_pi_lr
-        current_vf_lr = initial_vf_lr
-        
-        # LR scheduling parameters
-        patience = 5
-        epochs_without_improvement = 0
-        best_reward = float('-inf')
-        min_lr = 1e-6  # Minimum learning rate threshold
-        
         # Create PPO agent with correct input/output dimensions
         agent = PPO(
             env=env,
             n_steps=n_steps,
             batch_size=1024,
-            policy_hidden_sizes=[64, 64, 64],  # was 2048, 1024, 512
-            value_hidden_sizes=[64, 64, 64],    # was 2048, 1024, 512
+            policy_hidden_sizes=[2048, 1024, 512],  # Larger policy network
+            value_hidden_sizes=[1024, 512, 256],    # Larger value network
             gamma=0.95,
             clip_ratio=0.15,
-            pi_lr=current_pi_lr,
-            vf_lr=current_vf_lr,
+            pi_lr=3e-4,
+            vf_lr=1e-3,
             train_pi_iters=15,
             train_v_iters=15,
             lam=0.95,
@@ -440,13 +423,12 @@ def train_ddp(rank, world_size, processed_samples):
         if rank == 0:
             print(f"\nStarting training with {world_size} GPUs")
             print(f"Steps per GPU: {n_steps}")
-            print(f"Batch size per GPU: {per_gpu_batch_size}")
-            print(f"Initial pi_lr: {current_pi_lr:.2e}, Initial vf_lr: {current_vf_lr:.2e}\n")
+            print(f"Batch size per GPU: {per_gpu_batch_size}\n")
 
         # Training loop with better synchronization
         start_time = time.time()
         total_frames = 0
-        total_timesteps = 100_000
+        total_timesteps = 10_000
         episode_count = 0
         
         # Initialize metrics
@@ -474,56 +456,15 @@ def train_ddp(rank, world_size, processed_samples):
                     total_frames += n_steps
                     episode_count += 1
                     
-                    # Get current average reward
-                    rewards = agent.buffer.rews
-                    if isinstance(rewards, torch.Tensor):
-                        rewards = rewards.cpu().numpy()
-                    current_reward = np.mean(rewards)
-                    
-                    # Check if reward improved
-                    if current_reward > best_reward:
-                        best_reward = current_reward
-                        epochs_without_improvement = 0
-                    else:
-                        epochs_without_improvement += 1
-                    
-                    # Update learning rates if needed
-                    if epochs_without_improvement >= patience:
-                        # Halve learning rates
-                        current_pi_lr = max(current_pi_lr * 0.5, min_lr)
-                        current_vf_lr = max(current_vf_lr * 0.5, min_lr)
-                        
-                        # Update optimizer learning rates
-                        for param_group in agent.pi_optimizer.param_groups:
-                            param_group['lr'] = current_pi_lr
-                        for param_group in agent.vf_optimizer.param_groups:
-                            param_group['lr'] = current_vf_lr
-                            
-                        if rank == 0:
-                            print("\n" + "="*50)
-                            print("No improvement for 5 epochs - Updating learning rates:")
-                            print(f"New pi_lr: {current_pi_lr:.2e}")
-                            print(f"New vf_lr: {current_vf_lr:.2e}")
-                            print("="*50 + "\n")
-                            sys.stdout.flush()
-                        
-                        # Reset counter and check if we should restore initial rates
-                        epochs_without_improvement = 0
-                        if current_pi_lr <= min_lr or current_vf_lr <= min_lr:
-                            current_pi_lr = initial_pi_lr
-                            current_vf_lr = initial_vf_lr
-                            if rank == 0:
-                                print("\n" + "="*50)
-                                print("Learning rates too low - Restoring initial rates:")
-                                print(f"Restored pi_lr: {current_pi_lr:.2e}")
-                                print(f"Restored vf_lr: {current_vf_lr:.2e}")
-                                print("="*50 + "\n")
-                                sys.stdout.flush()
-                    
                     # Print metrics only from rank 0
                     if rank == 0:
                         elapsed_time = time.time() - start_time
                         fps = total_frames / elapsed_time
+                        
+                        # Convert rewards to numpy if they're tensors
+                        rewards = agent.buffer.rews
+                        if isinstance(rewards, torch.Tensor):
+                            rewards = rewards.cpu().numpy()
                         
                         print("\n" + "="*50)
                         print(f"Episode {episode_count} Summary:")
@@ -537,16 +478,14 @@ def train_ddp(rank, world_size, processed_samples):
                         print(f"Value Loss: {metrics['v_loss']:.4f}")
                         print(f"Policy KL: {metrics['policy_kl']:.4f}")
                         print(f"Clip Fraction: {metrics['clip_frac']:.4f}")
-                        print(f"Current pi_lr: {current_pi_lr:.2e}")
-                        print(f"Current vf_lr: {current_vf_lr:.2e}")
-                        print(f"Epochs without improvement: {epochs_without_improvement}")
                         print("\nReward Statistics:")
-                        print(f"Average Reward: {current_reward:.4f}")
-                        print(f"Best Reward: {best_reward:.4f}")
+                        print(f"Average Reward: {np.mean(rewards):.4f}")
                         print(f"Std Reward: {np.std(rewards):.4f}")
                         print(f"Max Reward: {np.max(rewards):.4f}")
                         print(f"Min Reward: {np.min(rewards):.4f}")
                         print("="*50 + "\n")
+                        
+                        # Ensure printing
                         sys.stdout.flush()
 
             except RuntimeError as e:
@@ -612,5 +551,3 @@ def train_custom_ppo():
 
 if __name__ == "__main__":
     train_custom_ppo()
-
-print(timm.list_models('*efficientnet*'))
