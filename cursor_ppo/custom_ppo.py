@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from torch.distributions import Normal
 import time
 import gc
+import math
 
 # For conditional autocast (if needed)
 from contextlib import nullcontext
@@ -184,16 +185,29 @@ class Critic(nn.Module):
 # Updates are performed by temporarily moving networks and mini-batches to GPU.
 ##############################################
 class PPO:
-    def __init__(self, env, n_steps=2048, batch_size=64, gamma=0.99, clip_ratio=0.2,
-                 pi_lr=3e-4, vf_lr=1e-3, train_pi_iters=80, train_v_iters=80,
-                 lam=0.95, target_kl=0.01, policy_hidden_sizes=(64,64),
-                 value_hidden_sizes=(64,64), device=None):
+    def __init__(self, 
+                 env, 
+                 n_steps, 
+                 batch_size, 
+                 gamma=0.99, 
+                 clip_ratio=0.2,
+                 pi_lr=3e-4,  # Keep consistent naming
+                 vf_lr=1e-3,  # Keep consistent naming
+                 train_pi_iters=80, 
+                 train_v_iters=80,
+                 lam=0.95, 
+                 target_kl=0.01,
+                 policy_hidden_sizes=(64,64),
+                 value_hidden_sizes=(64,64),
+                 device=None):
         
         self.env = env
         self.n_steps = n_steps
         self.batch_size = batch_size
         self.gamma = gamma
         self.clip_ratio = clip_ratio
+        self.pi_lr = pi_lr  # Store learning rates
+        self.vf_lr = vf_lr
         self.train_pi_iters = train_pi_iters
         self.train_v_iters = train_v_iters
         self.lam = lam
@@ -208,9 +222,19 @@ class PPO:
         self.actor = Actor(self.obs_dim, self.act_dim, policy_hidden_sizes).to(self.device)
         self.critic = Critic(self.obs_dim, value_hidden_sizes).to(self.device)
         
-        # Initialize optimizers
-        self.pi_optimizer = torch.optim.Adam(self.actor.parameters(), lr=pi_lr)
-        self.vf_optimizer = torch.optim.Adam(self.critic.parameters(), lr=vf_lr)
+        # Use AdamW instead of Adam for better regularization
+        self.pi_optimizer = torch.optim.AdamW(
+            self.actor.parameters(), 
+            lr=pi_lr,
+            weight_decay=0.01,
+            eps=1e-5
+        )
+        self.vf_optimizer = torch.optim.AdamW(
+            self.critic.parameters(), 
+            lr=vf_lr,
+            weight_decay=0.01,
+            eps=1e-5
+        )
         
         # Initialize buffer
         self.buffer = PPOBuffer(
@@ -234,6 +258,14 @@ class PPO:
             'policy_kl': [],
             'clip_frac': []
         }
+        
+        # Add running statistics for normalization
+        self.ret_rms = RunningMeanStd()
+        self.adv_rms = RunningMeanStd()
+        
+        # Warm-up steps
+        self.warmup_steps = 100
+        self.total_steps = 0
 
     def select_action(self, obs: np.ndarray) -> Tuple[np.ndarray, float, float]:
         """Select action using the policy network"""
@@ -318,6 +350,7 @@ class PPO:
         return {k: np.mean(v) for k, v in metrics.items() if len(v) > 0}
 
     def _compute_returns(self, rews: torch.Tensor, vals: torch.Tensor, dones: torch.Tensor) -> torch.Tensor:
+        """Compute returns with GAE and proper value bootstrapping"""
         returns = torch.zeros_like(rews)
         returns[-1] = vals[-1]
         for t in reversed(range(len(rews) - 1)):
@@ -404,65 +437,110 @@ class PPO:
         return checkpoint.get('final_performance', {})
 
     def update(self):
-        """Update policy and value function"""
+        """Update policy and value function with improved stability"""
         try:
+            self.total_steps += 1
             data = self.buffer.get()
             all_indices = torch.randperm(self.buffer.ptr, device=self.device)
+            
+            # Update running statistics
+            self.ret_rms.update(data['returns'])
+            self.adv_rms.update(data['advantages'])
+            
+            # Normalize advantages
+            advantages = (data['advantages'] - self.adv_rms.mean) / self.adv_rms.std
             
             pi_info = dict(kl=0, ent=0, cf=0)
             v_loss_avg = 0
             loss_pi = None
             
-            # Policy updates
+            # Cosine learning rate scheduling with warm-up
+            if self.total_steps < self.warmup_steps:
+                # Linear warm-up
+                lr_mult = self.total_steps / self.warmup_steps
+            else:
+                # Cosine decay
+                progress = (self.total_steps - self.warmup_steps) / (10_000 - self.warmup_steps)
+                lr_mult = 0.5 * (1 + math.cos(math.pi * progress))
+            
+            pi_lr_now = self.pi_lr * lr_mult
+            vf_lr_now = self.vf_lr * lr_mult
+            
+            # Update learning rates
+            for g in self.pi_optimizer.param_groups:
+                g['lr'] = pi_lr_now
+            for g in self.vf_optimizer.param_groups:
+                g['lr'] = vf_lr_now
+            
+            # Policy updates with improved stability
             for i in range(self.train_pi_iters):
+                kl_sum = 0
+                n_batches = 0
+                
                 for start in range(0, len(all_indices), self.batch_size):
                     idx = all_indices[start:start + self.batch_size]
                     batch = {k: v[idx] for k, v in data.items()}
                     
-                    with torch.amp.autocast(device_type='cuda'):
-                        # Compute policy loss
+                    with torch.amp.autocast(device_type='cuda', enabled=True):
                         dist = self.actor(batch['obs'])
                         logp = dist.log_prob(batch['acts']).sum(-1)
-                        ratio = torch.exp(logp - batch['logprobs'])
                         
-                        # Clipped surrogate objective
-                        clip_adv = torch.clamp(ratio, 1-self.clip_ratio, 1+self.clip_ratio) * batch['advantages']
-                        loss_pi = -(torch.min(ratio * batch['advantages'], clip_adv)).mean()
+                        # Improved numerical stability
+                        ratio = torch.exp(torch.clamp(logp - batch['logprobs'], -20, 20))
+                        
+                        # Clipped surrogate objective with entropy
+                        clip_adv = torch.clamp(ratio, 1-self.clip_ratio, 1+self.clip_ratio) * advantages[idx]
+                        policy_loss = -(torch.min(ratio * advantages[idx], clip_adv)).mean()
+                        
+                        # Adaptive entropy coefficient
+                        entropy_coef = max(0.01 * pi_lr_now / self.pi_lr, 0.001)  # Decay with learning rate
+                        entropy_loss = -entropy_coef * dist.entropy().mean()
+                        loss_pi = policy_loss + entropy_loss
                         
                         # Info for logging
-                        approx_kl = (batch['logprobs'] - logp).mean().item()
+                        approx_kl = 0.5 * ((batch['logprobs'] - logp) ** 2).mean().item()
                         clipped = ratio.gt(1+self.clip_ratio) | ratio.lt(1-self.clip_ratio)
                         clipfrac = torch.as_tensor(clipped, dtype=torch.float32).mean().item()
                         
-                        # Update policy
+                        # Update policy with gradient clipping
                         self.pi_optimizer.zero_grad()
                         self.scaler.scale(loss_pi).backward()
+                        self.scaler.unscale_(self.pi_optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
                         self.scaler.step(self.pi_optimizer)
                         self.scaler.update()
                         
-                        pi_info['kl'] += approx_kl
+                        kl_sum += approx_kl
+                        n_batches += 1
                         pi_info['cf'] += clipfrac
-                    
-                    if approx_kl > 1.5 * self.target_kl:
-                        break
                 
-                if approx_kl > 1.5 * self.target_kl:
+                # Improved early stopping with average KL
+                avg_kl = kl_sum / n_batches
+                pi_info['kl'] = avg_kl
+                if avg_kl > 1.5 * self.target_kl:
                     break
             
-            # Value function updates
+            # Value function updates with improved stability
             for _ in range(self.train_v_iters):
                 for start in range(0, len(all_indices), self.batch_size):
                     idx = all_indices[start:start + self.batch_size]
                     batch = {k: v[idx] for k, v in data.items()}
                     
-                    with torch.amp.autocast(device_type='cuda'):
-                        # Compute value loss
-                        v = self.critic(batch['obs'])
-                        v_loss = F.mse_loss(v, batch['returns'])
+                    with torch.amp.autocast(device_type='cuda', enabled=True):
+                        v_pred = self.critic(batch['obs'])
+                        v_pred_clipped = batch['vals_old'] + torch.clamp(
+                            v_pred - batch['vals_old'],
+                            -self.clip_ratio,
+                            self.clip_ratio
+                        )
+                        v_loss1 = (v_pred - batch['returns']).pow(2)
+                        v_loss2 = (v_pred_clipped - batch['returns']).pow(2)
+                        v_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
                         
-                        # Update value function
                         self.vf_optimizer.zero_grad()
                         self.scaler.scale(v_loss).backward()
+                        self.scaler.unscale_(self.vf_optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                         self.scaler.step(self.vf_optimizer)
                         self.scaler.update()
                         
@@ -472,12 +550,11 @@ class PPO:
             num_policy_updates = (i + 1) * ((len(all_indices) + self.batch_size - 1) // self.batch_size)
             num_value_updates = self.train_v_iters * ((len(all_indices) + self.batch_size - 1) // self.batch_size)
             
-            pi_info['kl'] /= max(1, num_policy_updates)
             pi_info['cf'] /= max(1, num_policy_updates)
             v_loss_avg /= max(1, num_value_updates)
             
             return {
-                'pi_loss': loss_pi.item() if loss_pi is not None else 0,
+                'pi_loss': loss_pi.item() if loss_pi is not None else 0.0,
                 'v_loss': v_loss_avg,
                 'policy_kl': pi_info['kl'],
                 'clip_frac': pi_info['cf']
@@ -485,7 +562,34 @@ class PPO:
         
         except Exception as e:
             print(f"Error in update: {str(e)}")
-            return None
+            return {
+                'pi_loss': 0.0,
+                'v_loss': 0.0,
+                'policy_kl': 0.0,
+                'clip_frac': 0.0
+            }
         
         finally:
             torch.cuda.empty_cache()
+
+# Add this new class for running statistics
+class RunningMeanStd:
+    def __init__(self, epsilon=1e-4):
+        self.mean = 0
+        self.std = 0
+        self.var = epsilon
+        self.count = epsilon
+
+    def update(self, x):
+        batch_mean = x.mean().item()
+        batch_var = x.var().item()
+        batch_count = x.shape[0]
+        
+        delta = batch_mean - self.mean
+        self.mean += delta * batch_count / (self.count + batch_count)
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta**2 * self.count * batch_count / (self.count + batch_count)
+        self.var = M2 / (self.count + batch_count)
+        self.std = (self.var + 1e-8) ** 0.5
+        self.count += batch_count

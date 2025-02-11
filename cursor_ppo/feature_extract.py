@@ -256,18 +256,28 @@ class FilterWeightingSegmenter(nn.Module):
     """
     High-level module that outputs a 256-channel feature map from a ResNet50-FPN.
     """
-    def __init__(self, pretrained=True, rank=None, out_channels=256):
+    def __init__(self, pretrained=True):
         super().__init__()
-        self.rank = rank if rank is not None else 0
-        
         self.feature_extractor = HybridResNet50FPN(
             pretrained=pretrained, 
-            out_channels=out_channels,
-            rank=self.rank
+            out_channels=256
         )
+        self.use_checkpointing = False
+
+    def enable_gradient_checkpointing(self):
+        """Enable gradient checkpointing for memory efficiency"""
+        self.use_checkpointing = True
+        # Enable for backbone if available
+        if hasattr(self.feature_extractor, 'gradient_checkpointing_enable'):
+            self.feature_extractor.gradient_checkpointing_enable()
 
     @torch.amp.autocast('cuda')
     def forward(self, x):
+        if self.use_checkpointing and self.training:
+            return torch.utils.checkpoint.checkpoint(self._forward, x)
+        return self._forward(x)
+
+    def _forward(self, x):
         return self.feature_extractor(x)
 
 ###############################################################################

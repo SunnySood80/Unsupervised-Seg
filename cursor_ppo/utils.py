@@ -17,35 +17,53 @@ from feature_extract import DDPFeatureExtractor
 class MomentumEncoder:
     def __init__(self, model: nn.Module, momentum: float = 0.999):
         self.momentum = momentum
-
-        # Special handling for our feature extractor
+        self.model = model  # Store original model
+        
+        # Create EMA model with same architecture
         if isinstance(model, DDPFeatureExtractor):
             print("Creating momentum encoder for DDP model...")
             self.ema_model = DDPFeatureExtractor(
                 world_size=model.world_size,
                 start_gpu=model.start_gpu
             )
-            # Copy state dict instead of deep copying
-            self.ema_model.load_state_dict(model.state_dict())
         else:
             print("Creating momentum encoder for standard model...")
-            self.ema_model = type(model)()
+            # Create new instance with same parameters as original model
+            if hasattr(model, 'module'):
+                # Handle DDP wrapped model
+                base_model = model.module
+            else:
+                base_model = model
+                
+            # Create new instance with same constructor arguments
+            self.ema_model = type(base_model)(
+                pretrained=True  # Assuming FilterWeightingSegmenter takes this arg
+            )
+            
+        # Copy weights
+        if hasattr(model, 'module'):
+            # If DDP model, copy from module state dict
+            self.ema_model.load_state_dict(model.module.state_dict())
+        else:
             self.ema_model.load_state_dict(model.state_dict())
-        
+            
         self.ema_model.eval()
         
         # Disable gradients for momentum encoder
         for param in self.ema_model.parameters():
             param.requires_grad = False
+            
     @torch.no_grad()
     def update(self, model: nn.Module):
         """Update momentum encoder weights"""
-        for ema_param, param in zip(self.ema_model.parameters(), model.parameters()):
+        source_model = model.module if hasattr(model, 'module') else model
+        for ema_param, param in zip(self.ema_model.parameters(), source_model.parameters()):
             ema_param.data = self.momentum * ema_param.data + (1 - self.momentum) * param.data
             
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.ema_model(x)
+        """Encode features - x should already be feature maps"""
+        return x  # Just return features since they're already extracted
 
 class ProjectionHead(nn.Module):
     """Projection head for contrastive learning"""

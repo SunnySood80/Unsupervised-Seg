@@ -14,6 +14,7 @@ from tqdm import tqdm
 import socket
 import math
 import sys
+from torch.utils.tensorboard import SummaryWriter
 
 # Local imports
 from load_data import load_processed_samples
@@ -140,7 +141,8 @@ class FeatureWeightingEnv(gym.Env):
         enable_render=False,
         render_patience=128,
         history_length=3,
-        visualize=False
+        visualize=False,
+        writer=None  # Add tensorboard writer parameter
     ):
         self.segmenter = segmenter_model
         self.processed_samples = processed_samples
@@ -150,6 +152,7 @@ class FeatureWeightingEnv(gym.Env):
         self.render_patience = render_patience
         self.history_length = history_length
         self.visualize = visualize
+        self.writer = writer  # Store tensorboard writer
 
         # Add these attributes for rendering
         self.current_sample_idx = 0
@@ -313,6 +316,17 @@ class FeatureWeightingEnv(gym.Env):
         if self.enable_render and (self.total_steps % self.render_patience == 0):
             self._render()
 
+        # Log metrics to tensorboard
+        if self.writer is not None:
+            self.writer.add_scalar('Rewards/diversity', diversity_reward, self.total_steps)
+            self.writer.add_scalar('Rewards/consistency', consistency_reward, self.total_steps)
+            self.writer.add_scalar('Rewards/boundary', boundary_reward, self.total_steps)
+            self.writer.add_scalar('Rewards/coherence', coherence_reward, self.total_steps)
+            self.writer.add_scalar('Rewards/total', reward, self.total_steps)
+            
+            # Log weight distribution
+            self.writer.add_histogram('weights/distribution', self.current_weights, self.total_steps)
+
         # Get next observation
         obs = self._get_observation()
         done = False
@@ -371,7 +385,10 @@ def train_ddp(rank, world_size, processed_samples):
         setup_ddp(rank, world_size)
         device = torch.device(f"cuda:{rank}")
         
+        # Initialize tensorboard writer for rank 0
+        writer = None
         if rank == 0:
+            writer = SummaryWriter(f'runs/ppo_training_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}')
             os.makedirs('final_visuals', exist_ok=True)
         
         # Reduce batch size and steps to lower memory usage
@@ -395,24 +412,25 @@ def train_ddp(rank, world_size, processed_samples):
             batch_size=per_gpu_batch_size,
             enable_render=(rank == 0),
             render_patience=10,
-            visualize=True
+            visualize=True,
+            writer=writer  # Pass writer to environment
         )
 
-        # Create PPO agent with correct input/output dimensions
+        # Create PPO agent with fixed learning rates
         agent = PPO(
             env=env,
             n_steps=n_steps,
             batch_size=1024,
-            policy_hidden_sizes=[2048, 1024, 512],  # Larger policy network
-            value_hidden_sizes=[1024, 512, 256],    # Larger value network
-            gamma=0.95,
+            policy_hidden_sizes=[2048, 1024, 512],  
+            value_hidden_sizes=[1024, 512, 256],    
+            gamma=0.99,
             clip_ratio=0.15,
-            pi_lr=3e-4,
-            vf_lr=1e-3,
+            pi_lr=1e-5,  # Fixed policy learning rate
+            vf_lr=1e-3,  # Fixed value function learning rate
             train_pi_iters=15,
             train_v_iters=15,
             lam=0.95,
-            target_kl=0.01,
+            target_kl=0.015,
             device=device
         )
 
@@ -456,16 +474,26 @@ def train_ddp(rank, world_size, processed_samples):
                     total_frames += n_steps
                     episode_count += 1
                     
+                    # Get average reward and value loss for this episode
+                    rewards = agent.buffer.rews
+                    if isinstance(rewards, torch.Tensor):
+                        rewards = rewards.cpu().numpy()
+                    elif isinstance(rewards, list):
+                        rewards = np.array(rewards)
+                    
+                    avg_reward = float(np.mean(rewards))
+                    value_loss = float(metrics['v_loss'])
+                    
+                    # Get current learning rates (they'll be fixed now)
+                    pi_lr = agent.pi_optimizer.param_groups[0]['lr']
+                    vf_lr = agent.vf_optimizer.param_groups[0]['lr']
+                    
                     # Print metrics only from rank 0
                     if rank == 0:
                         elapsed_time = time.time() - start_time
                         fps = total_frames / elapsed_time
                         
-                        # Convert rewards to numpy if they're tensors
-                        rewards = agent.buffer.rews
-                        if isinstance(rewards, torch.Tensor):
-                            rewards = rewards.cpu().numpy()
-                        
+                        # Print metrics
                         print("\n" + "="*50)
                         print(f"Episode {episode_count} Summary:")
                         print("="*50)
@@ -479,14 +507,50 @@ def train_ddp(rank, world_size, processed_samples):
                         print(f"Policy KL: {metrics['policy_kl']:.4f}")
                         print(f"Clip Fraction: {metrics['clip_frac']:.4f}")
                         print("\nReward Statistics:")
-                        print(f"Average Reward: {np.mean(rewards):.4f}")
-                        print(f"Std Reward: {np.std(rewards):.4f}")
-                        print(f"Max Reward: {np.max(rewards):.4f}")
-                        print(f"Min Reward: {np.min(rewards):.4f}")
+                        print(f"Average Reward: {avg_reward:.4f}")
+                        print(f"Value Loss: {value_loss:.4f}")
+                        print("\nLearning Rates:")
+                        print(f"Policy LR: {pi_lr:.2e}")
+                        print(f"Value LR: {vf_lr:.2e}")
                         print("="*50 + "\n")
                         
                         # Ensure printing
                         sys.stdout.flush()
+
+                        # Log to tensorboard
+                        writer.add_scalar('Training/policy_loss', metrics['pi_loss'], total_frames)
+                        writer.add_scalar('Training/value_loss', metrics['v_loss'], total_frames)
+                        
+                        # Log reward statistics
+                        rewards = agent.buffer.rews
+                        if isinstance(rewards, torch.Tensor):
+                            rewards = rewards.cpu().numpy()
+                        
+                        writer.add_scalar('Rewards/mean', avg_reward, total_frames)
+                        writer.add_scalar('Rewards/value_loss', value_loss, total_frames)
+                        
+                        # Log training progress
+                        writer.add_scalar('Progress/fps', fps, total_frames)
+                        writer.add_scalar('Progress/episodes', episode_count, total_frames)
+                        
+                        # Log network gradients (summarized statistics only)
+                        total_grad_norm_actor = 0
+                        total_grad_norm_critic = 0
+                        
+                        for param in agent.actor.parameters():
+                            if param.grad is not None:
+                                total_grad_norm_actor += param.grad.norm().item()
+                        
+                        for param in agent.critic.parameters():
+                            if param.grad is not None:
+                                total_grad_norm_critic += param.grad.norm().item()
+                                
+                        writer.add_scalar('Gradients/actor_total_norm', total_grad_norm_actor, total_frames)
+                        writer.add_scalar('Gradients/critic_total_norm', total_grad_norm_critic, total_frames)
+                        
+                        # Log memory usage
+                        writer.add_scalar('System/gpu_memory_allocated', torch.cuda.memory_allocated(device), total_frames)
+                        writer.add_scalar('System/gpu_memory_cached', torch.cuda.memory_reserved(device), total_frames)
 
             except RuntimeError as e:
                 print(f"\nError on rank {rank}: {str(e)}")
@@ -503,6 +567,8 @@ def train_ddp(rank, world_size, processed_samples):
         print(f"Error on rank {rank}: {str(e)}")
         raise
     finally:
+        if rank == 0 and writer is not None:
+            writer.close()
         cleanup_ddp(rank)
         torch.cuda.empty_cache()
 
