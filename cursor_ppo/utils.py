@@ -82,11 +82,9 @@ class ProjectionHead(nn.Module):
 
 def compute_feature_diversity(features: torch.Tensor, batch_size: int = 64) -> float:
     """
-    Compute diversity score for features in a memory-efficient way
-    
-    Args:
-        features: Tensor of shape [B, C, H, W] or [C, H, W]
-        batch_size: Size of batches to process at once
+    Improve diversity computation to better separate cancer/non-cancer regions:
+    - Add structural prior that cancer regions tend to be more heterogeneous
+    - Consider local neighborhood statistics
     """
     # Ensure features are batched
     if features.dim() == 3:
@@ -132,6 +130,10 @@ def compute_feature_diversity(features: torch.Tensor, batch_size: int = 64) -> f
     # Convert similarity to diversity (higher is better)
     diversity = 1 - avg_similarity
     
+    # Add structural prior weighting
+    local_variance = compute_local_feature_variance(features)  # Higher for cancer regions
+    diversity = diversity * (1 + local_variance)  # Boost diversity score for heterogeneous regions
+    
     return diversity
 
 def compute_feature_statistics(features):
@@ -163,26 +165,30 @@ def track_memory(func):
 
 def compute_consistency_reward(original_feats: torch.Tensor, aug_feats_list: List[torch.Tensor] = None) -> float:
     """
-    Compute consistency reward between original features and its augmentations.
-    If no augmentations provided, return a neutral reward.
+    Enhanced consistency reward that better handles cancer tissue characteristics:
+    - Cancer regions: Allow more internal variation (heterogeneous)
+    - Normal regions: Expect more uniformity
+    - Boundaries: Maintain strong consistency
     """
     if aug_feats_list is None or len(aug_feats_list) == 0:
-        return 0.5  # Neutral reward when no augmentations
+        return 0.5
         
-    orig_flat = original_feats.view(original_feats.size(0), original_feats.size(1), -1)
+    # Get local feature statistics
+    orig_var = compute_local_variance(original_feats)  # High in cancer regions
     
     similarities = []
     for aug_feats in aug_feats_list:
-        aug_flat = aug_feats.view(aug_feats.size(0), aug_feats.size(1), -1)
+        # Compute feature similarity but weight it based on local variance
+        sim = compute_feature_similarity(original_feats, aug_feats)
         
-        orig_norm = F.normalize(orig_flat, dim=2)
-        aug_norm = F.normalize(aug_flat, dim=2)
+        # Key insight: Allow more disagreement in high-variance (cancer) regions
+        # while enforcing stricter consistency in uniform (normal) regions
+        adaptive_weight = torch.sigmoid(-orig_var + 0.5)  # Lower weight for high variance regions
+        weighted_sim = sim * adaptive_weight
         
-        similarity = torch.bmm(orig_norm, aug_norm.transpose(1, 2)).mean(dim=(1, 2))
-        similarities.append(similarity)
+        similarities.append(weighted_sim.mean())
     
-    avg_similarity = torch.stack(similarities).mean()
-    return float(avg_similarity.item())
+    return float(torch.stack(similarities).mean().item())
 
 def compute_boundary_strength(features: torch.Tensor) -> float:
     """
@@ -412,3 +418,42 @@ def visualize_map_with_augs(
     if save_path:
         plt.savefig(save_path)
     plt.close()
+
+def compute_local_feature_variance(features: torch.Tensor, kernel_size: int = 3) -> torch.Tensor:
+    """
+    Compute local variance of features in a neighborhood.
+    Higher variance indicates more heterogeneous regions (likely cancer).
+    
+    Args:
+        features: Tensor of shape [B, C, H, W]
+        kernel_size: Size of local neighborhood
+    Returns:
+        Local variance map
+    """
+    if features.dim() == 3:
+        features = features.unsqueeze(0)
+        
+    B, C, H, W = features.shape
+    
+    # Compute local mean
+    padding = kernel_size // 2
+    local_mean = F.avg_pool2d(
+        features,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=padding
+    )
+    
+    # Compute local variance
+    local_var = F.avg_pool2d(
+        (features - local_mean)**2,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=padding
+    )
+    
+    # Normalize variance
+    local_var = local_var.mean(dim=1, keepdim=True)  # Average across channels
+    local_var = (local_var - local_var.min()) / (local_var.max() - local_var.min() + 1e-8)
+    
+    return local_var.squeeze(1).mean()  # Return scalar variance score
