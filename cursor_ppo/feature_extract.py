@@ -16,20 +16,28 @@ torch.backends.cudnn.allow_tf32 = True
 #  SmallTransformerEncoder (optional if you need it)
 ###############################################################################
 class SmallTransformerEncoder(nn.Module):
-    def __init__(self, embed_dim=1024, num_heads=8, num_layers=4, rank=None):
+    def __init__(self, embed_dim=1024, num_heads=16, num_layers=2, rank=None):
         super().__init__()
         self.rank = rank if rank is not None else 0
         self.device = torch.device(f'cuda:{self.rank}')
         
+        # Increased number of layers and added relative position encoding
+        self.num_layers = 4  # Increased from 2
+        self.pos_encoding = nn.Parameter(torch.randn(1, 256, embed_dim) * 0.02)
+        
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
             nhead=num_heads,
-            dim_feedforward=embed_dim * 2,
+            dim_feedforward=embed_dim * 4,  # Doubled feedforward dimension
             dropout=0.1,
             batch_first=True,
             norm_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=self.num_layers)
+        
+        # Added learnable temperature parameter
+        self.temperature = nn.Parameter(torch.ones(1) * 0.07)
+        
         self.pool = nn.AvgPool2d(kernel_size=2, stride=2, ceil_mode=True)
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.relu = nn.ReLU(inplace=True)
@@ -40,12 +48,17 @@ class SmallTransformerEncoder(nn.Module):
         x_reduced = self.pool(x)
         x_flat = x_reduced.flatten(2).transpose(1, 2)
         
+        # Add positional encoding
+        seq_len = x_flat.shape[1]
+        pos_enc = self.pos_encoding[:, :seq_len, :]
+        x_flat = x_flat + pos_enc
+        
         if self.training:
             def transformer_chunk(x):
-                return self.transformer(x)
+                return self.transformer(x / self.temperature.exp())
             x_transformed = checkpoint(transformer_chunk, x_flat, use_reentrant=False)
         else:
-            x_transformed = self.transformer(x_flat)
+            x_transformed = self.transformer(x_flat / self.temperature.exp())
         
         x_restored = x_transformed.transpose(1, 2).view(B, C, H // 2, W // 2)
         x_upsampled = self.upsample(x_restored)
@@ -124,7 +137,7 @@ class FPNDecoder(nn.Module):
 #  CrossSetAttention
 ###############################################################################
 class CrossSetAttention(nn.Module):
-    def __init__(self, embed_dim=256, num_heads=4):
+    def __init__(self, embed_dim=1024, num_heads=16):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = embed_dim // num_heads
@@ -201,7 +214,7 @@ class HybridResNet50FPN(nn.Module):
         self.layer3 = base_resnet.layer3  # 1024 channels
 
         # Add transformer and FPN
-        self.transformer = SmallTransformerEncoder(embed_dim=1024, rank=self.rank)
+        self.transformer = SmallTransformerEncoder(embed_dim=1024, num_heads=16, num_layers=2, rank=self.rank)
         self.fpn = FPNDecoder(
             in_channels_list=(256, 512, 1024),
             out_channels=out_channels,
@@ -211,7 +224,7 @@ class HybridResNet50FPN(nn.Module):
         # Add cross-set attention after transformer
         self.cross_attention = CrossSetAttention(
             embed_dim=out_channels,
-            num_heads=4
+            num_heads=16
         )
         
         # Feature caching
@@ -256,28 +269,18 @@ class FilterWeightingSegmenter(nn.Module):
     """
     High-level module that outputs a 256-channel feature map from a ResNet50-FPN.
     """
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, rank=None, out_channels=256):
         super().__init__()
+        self.rank = rank if rank is not None else 0
+        
         self.feature_extractor = HybridResNet50FPN(
             pretrained=pretrained, 
-            out_channels=256
+            out_channels=out_channels,
+            rank=self.rank
         )
-        self.use_checkpointing = False
-
-    def enable_gradient_checkpointing(self):
-        """Enable gradient checkpointing for memory efficiency"""
-        self.use_checkpointing = True
-        # Enable for backbone if available
-        if hasattr(self.feature_extractor, 'gradient_checkpointing_enable'):
-            self.feature_extractor.gradient_checkpointing_enable()
 
     @torch.amp.autocast('cuda')
     def forward(self, x):
-        if self.use_checkpointing and self.training:
-            return torch.utils.checkpoint.checkpoint(self._forward, x)
-        return self._forward(x)
-
-    def _forward(self, x):
         return self.feature_extractor(x)
 
 ###############################################################################

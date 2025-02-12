@@ -300,9 +300,9 @@ class FeatureWeightingEnv(gym.Env):
             # Combine rewards with weights
             reward = (
                 0.4 * diversity_reward +
-                0.3 * consistency_reward +
+                0.3 * consistency_reward + # try .05
                 0.2 * boundary_reward +
-                0.1 * coherence_reward
+                0.1 * coherence_reward # try .015
             )
 
         # Store metrics
@@ -416,22 +416,47 @@ def train_ddp(rank, world_size, processed_samples):
             writer=writer  # Pass writer to environment
         )
 
-        # Create PPO agent with fixed learning rates
+        # Create PPO agent with learning rate schedulers
+        initial_pi_lr = 1e-5  # Keep current initial policy learning rate
+        initial_vf_lr = 1e-3  # Keep current initial value function learning rate
+        
+        # Define learning rate scheduler parameters
+        lr_decay_steps = 10_000  # Total steps after which learning rate reaches minimum
+        min_lr = 1e-6  # Minimum learning rate
+        
+        def get_lr_lambda(initial_lr):
+            def lr_lambda(step):
+                # Linear decay from initial_lr to min_lr over lr_decay_steps
+                decay_factor = 1.0 - (min(step, lr_decay_steps) / lr_decay_steps)
+                return max(min_lr / initial_lr, decay_factor)
+            return lr_lambda
+
         agent = PPO(
             env=env,
             n_steps=n_steps,
             batch_size=1024,
             policy_hidden_sizes=[2048, 1024, 512],  
-            value_hidden_sizes=[1024, 512, 256],    
+            value_hidden_sizes=[512, 512, 256],    
             gamma=0.99,
             clip_ratio=0.15,
-            pi_lr=1e-5,  # Fixed policy learning rate
-            vf_lr=1e-3,  # Fixed value function learning rate
+            pi_lr=initial_pi_lr,
+            vf_lr=initial_vf_lr,
             train_pi_iters=15,
             train_v_iters=15,
             lam=0.95,
             target_kl=0.015,
             device=device
+        )
+
+        # Create schedulers after optimizer initialization
+        pi_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            agent.pi_optimizer, 
+            lr_lambda=get_lr_lambda(initial_pi_lr)
+        )
+        
+        vf_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            agent.vf_optimizer,
+            lr_lambda=get_lr_lambda(initial_vf_lr)
         )
 
         # Move networks to GPU and wrap in DDP
@@ -484,7 +509,11 @@ def train_ddp(rank, world_size, processed_samples):
                     avg_reward = float(np.mean(rewards))
                     value_loss = float(metrics['v_loss'])
                     
-                    # Get current learning rates (they'll be fixed now)
+                    # Update learning rates based on steps
+                    pi_scheduler.step(total_frames)
+                    vf_scheduler.step(total_frames)
+                    
+                    # Get current learning rates
                     pi_lr = agent.pi_optimizer.param_groups[0]['lr']
                     vf_lr = agent.vf_optimizer.param_groups[0]['lr']
                     
@@ -551,6 +580,10 @@ def train_ddp(rank, world_size, processed_samples):
                         # Log memory usage
                         writer.add_scalar('System/gpu_memory_allocated', torch.cuda.memory_allocated(device), total_frames)
                         writer.add_scalar('System/gpu_memory_cached', torch.cuda.memory_reserved(device), total_frames)
+
+                        # Add learning rate logging to tensorboard
+                        writer.add_scalar('LearningRates/policy_lr', pi_lr, total_frames)
+                        writer.add_scalar('LearningRates/value_lr', vf_lr, total_frames)
 
             except RuntimeError as e:
                 print(f"\nError on rank {rank}: {str(e)}")
